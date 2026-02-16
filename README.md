@@ -1,36 +1,26 @@
-![mydump](mydump.png)
-
 # mydump
 
 `mydump.php` dumps a MySQL schema to `.xlsx` or `.json/.js`, and can read the same file back to create/alter a database.
 
+Dump the database structure, edit it with Miscrosoft Excel, import it back applying the required *alter*ings.
+
 ## Features
 
-- `dump` mode: export database structure.
-- `write` mode: import structure, create DB if missing, alter existing tables/views to match.
-- Format auto-detection from file extension:
-  - `.xlsx` => XLSX mode
-  - `.json` / `.js` => JSON mode
-- Optional interactive prompts when parameters are missing.
-- Safety prompt in `write` mode unless `--run` is provided.
-- Auto-include of `kalei.php` (if present) before connection resolution.
+Support for `.json` and `.xlsx` for input and output data format.
+
+No dependencies.
 
 ## Requirements
 
 - PHP 8+
-- `pdo_mysql`
-- `zip` (`ZipArchive`) for XLSX read/write
-- `readline` optional (fallback to STDIN)
 
 ## Connection Parameter Resolution
 
 Order used by the tool:
 
-1. User-defined constants (loaded after including `kalei.php`)
+1. Hard-coded constants (if present)
 2. CLI args
 3. Interactive prompt
-
-`kalei.php` is included from the same folder as `mydump.php` if it exists.
 
 Supported args:
 
