@@ -1,8 +1,14 @@
+![mydump](mydump.png)
+
+&nbsp;
+
 # mydump
 
 `mydump.php` dumps a MySQL schema to `.xlsx` or `.json/.js`, and can read the same file back to create/alter a database.
 
 Dump the database structure, edit it with Miscrosoft Excel, import it back applying the required *alter*ings.
+
+&nbsp;
 
 ## Features
 
@@ -10,9 +16,13 @@ Support for `.json` and `.xlsx` for input and output data format.
 
 No dependencies.
 
+&nbsp;
+
 ## Requirements
 
 - PHP 8+
+
+&nbsp;
 
 ## Connection Parameter Resolution
 
@@ -31,6 +41,8 @@ Supported args:
 - `-db`
 - `-o` (dump output file)
 - `--run` (write mode: skip confirmation)
+
+&nbsp;
 
 ## Usage
 
@@ -59,6 +71,8 @@ Shortcut:
 ```bash
 php mydump.php schema.xlsx -db mydb
 ```
+
+&nbsp;
 
 ## XLSX Layout
 
@@ -96,6 +110,8 @@ Cell font style applied in XLSX output:
 }
 ```
 
+&nbsp;
+
 ## JSON Structure
 
 Top-level keys:
@@ -112,9 +128,3 @@ Each object contains:
 - `create_sql`
 - `fields`
 - `indexes`
-
-## Notes
-
-- `write` mode uses ALTER statements for existing tables and `CREATE OR REPLACE` for views.
-- If the database already exists, the tool asks for confirmation unless `--run` is passed.
-- Input is normalized, so both `objects` and `tables`/`views` JSON layouts are accepted.
