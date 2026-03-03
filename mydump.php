@@ -39,15 +39,7 @@ function mydump_main(array $argv): void
 function mydump_run_dump_mode(array $cli): void
 {
     $options = $cli['options'];
-    $outputFile = (string) ($options['output'] ?? '');
-    if ($outputFile === '') {
-        $outputFile = mydump_prompt('Output file (.xlsx/.json/.js)', null, true);
-    }
-
-    $format = mydump_detect_format($outputFile);
-    if ($format === null) {
-        throw new RuntimeException('Unsupported output extension. Use .xlsx, .json or .js');
-    }
+    $targets = mydump_resolve_dump_targets($cli);
 
     $conn = mydump_resolve_connection($options, null);
 
@@ -58,8 +50,71 @@ function mydump_run_dump_mode(array $cli): void
 
     $schema = mydump_fetch_schema($pdo, $conn['db']);
 
-    mydump_write_schema_file($schema, $outputFile, $format);
-    fwrite(STDOUT, "Dump complete: {$outputFile}" . PHP_EOL);
+    foreach ($targets as $target) {
+        mydump_write_schema_file($schema, $target['path'], $target['format']);
+        fwrite(STDOUT, 'Dump complete: ' . $target['path'] . PHP_EOL);
+    }
+
+    if (count($targets) > 1) {
+        fwrite(STDOUT, 'Wrote ' . count($targets) . ' output files.' . PHP_EOL);
+    }
+}
+
+function mydump_resolve_dump_targets(array $cli): array
+{
+    $options = $cli['options'] ?? [];
+    $candidates = [];
+
+    foreach ((array) ($options['outputs'] ?? []) as $output) {
+        $candidates[] = (string) $output;
+    }
+    if (empty($candidates) && !empty($options['output'])) {
+        $candidates[] = (string) $options['output'];
+    }
+
+    if (empty($candidates)) {
+        $line = mydump_prompt('Output file(s) (.xlsx/.json/.js, comma-separated)', null, true);
+        foreach (array_map('trim', explode(',', $line)) as $part) {
+            if ($part !== '') {
+                $candidates[] = $part;
+            }
+        }
+    }
+
+    if (empty($candidates)) {
+        throw new RuntimeException('At least one output file is required in dump mode.');
+    }
+
+    $unique = [];
+    $seen = [];
+    foreach ($candidates as $candidate) {
+        $path = trim((string) $candidate);
+        if ($path === '') {
+            continue;
+        }
+
+        $key = strtolower($path);
+        if (isset($seen[$key])) {
+            continue;
+        }
+
+        $format = mydump_detect_format($path);
+        if ($format === null) {
+            throw new RuntimeException("Unsupported output extension for '{$path}'. Use .xlsx, .json or .js");
+        }
+
+        $seen[$key] = true;
+        $unique[] = [
+            'path' => $path,
+            'format' => $format,
+        ];
+    }
+
+    if (empty($unique)) {
+        throw new RuntimeException('At least one valid output file is required in dump mode.');
+    }
+
+    return $unique;
 }
 
 function mydump_run_write_mode(array $cli): void

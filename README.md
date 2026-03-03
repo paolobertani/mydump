@@ -16,6 +16,8 @@ Support for `.json` and `.xlsx` for input and output data format.
 
 No dependencies.
 
+In dump mode you can write multiple outputs in one run (for example JSON and XLSX together).
+
 &nbsp;
 
 ## Requirements
@@ -39,7 +41,9 @@ Supported args:
 - `-user` (default `root`)
 - `-pass`
 - `-db`
-- `-o` (dump output file)
+- `-o` / `--output` (dump output file, repeatable)
+- `--json` (explicit JSON output path)
+- `--xlsx` (explicit XLSX output path)
 - `--run` (write mode: skip confirmation)
 
 &nbsp;
@@ -51,6 +55,8 @@ Supported args:
 ```bash
 php mydump.php dump -o schema.xlsx -db mydb -user root -pass secret
 php mydump.php dump -o schema.json -db mydb
+php mydump.php dump -o schema.json -o schema.xlsx -db mydb
+php mydump.php dump --json schema.json --xlsx schema.xlsx -db mydb
 ```
 
 Shortcut:

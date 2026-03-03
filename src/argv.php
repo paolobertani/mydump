@@ -13,12 +13,15 @@ function mydump_parse_cli(array $argv): array
         if ($head === 'dump' || $head === 'write') {
             $command = $head;
             array_shift($tokens);
+        } elseif ($head === 'help') {
+            $command = 'help';
+            array_shift($tokens);
         }
     }
 
     $rawOptions = [];
     $positionals = [];
-    $flags = ['run', 'help', 'h', '?'];
+    $flags = ['run', 'help', '?'];
 
     for ($i = 0, $n = count($tokens); $i < $n; $i++) {
         $token = (string) $tokens[$i];
@@ -30,12 +33,7 @@ function mydump_parse_cli(array $argv): array
             break;
         }
 
-        if ($token === '' || $token === '-') {
-            $positionals[] = $token;
-            continue;
-        }
-
-        if ($token[0] !== '-') {
+        if ($token === '' || $token === '-' || $token[0] !== '-') {
             $positionals[] = $token;
             continue;
         }
@@ -46,13 +44,16 @@ function mydump_parse_cli(array $argv): array
             continue;
         }
 
-        $name = $trimmed;
+        $name = strtolower($trimmed);
         $value = true;
+
         if (str_contains($trimmed, '=')) {
-            [$name, $value] = explode('=', $trimmed, 2);
-        } elseif (!in_array(strtolower($trimmed), $flags, true)) {
+            [$nameRaw, $valueRaw] = explode('=', $trimmed, 2);
+            $name = strtolower($nameRaw);
+            $value = (string) $valueRaw;
+        } elseif (!in_array($name, $flags, true)) {
             $next = $tokens[$i + 1] ?? null;
-            if ($next !== null && (string) $next !== '--') {
+            if ($next !== null && (string) $next !== '--' && !str_starts_with((string) $next, '-')) {
                 $value = (string) $next;
                 $i++;
             } else {
@@ -60,41 +61,79 @@ function mydump_parse_cli(array $argv): array
             }
         }
 
-        $rawOptions[strtolower($name)] = $value;
+        if (!isset($rawOptions[$name])) {
+            $rawOptions[$name] = [];
+        }
+        $rawOptions[$name][] = $value;
     }
 
     $options = [
-        'host' => mydump_option_value($rawOptions, ['host', 'h']),
-        'port' => mydump_option_value($rawOptions, ['port', 'p']),
-        'user' => mydump_option_value($rawOptions, ['user', 'u']),
+        'host' => mydump_option_value($rawOptions, ['host']),
+        'port' => mydump_option_value($rawOptions, ['port']),
+        'user' => mydump_option_value($rawOptions, ['user']),
         'pass' => mydump_option_value($rawOptions, ['pass', 'password']),
         'db' => mydump_option_value($rawOptions, ['db', 'database']),
+        'input' => mydump_option_value($rawOptions, ['i', 'input']),
         'output' => mydump_option_value($rawOptions, ['o', 'output']),
+        'outputs' => mydump_option_values($rawOptions, ['o', 'output']),
+        'json_output' => mydump_option_value($rawOptions, ['json']),
+        'xlsx_output' => mydump_option_value($rawOptions, ['xlsx']),
         'run' => mydump_option_flag($rawOptions, ['run']),
-        'help' => mydump_option_flag($rawOptions, ['help', 'h', '?']),
+        'help' => $command === 'help' || mydump_option_flag($rawOptions, ['help', '?']),
         'positionals' => $positionals,
     ];
 
-    $mode = $command;
-    if ($mode === null) {
-        if (!empty($options['output'])) {
+    $hasDumpOutputArgs = !empty($options['outputs'])
+        || !empty($options['json_output'])
+        || !empty($options['xlsx_output']);
+
+    $mode = null;
+    if ($command === 'dump' || $command === 'write') {
+        $mode = $command;
+    }
+
+    if ($mode === null && !$options['help']) {
+        if ($hasDumpOutputArgs) {
             $mode = 'dump';
         } else {
-            $firstDataFile = mydump_find_file_positional($positionals);
-            if ($firstDataFile !== null) {
+            if (!empty($options['input'])) {
                 $mode = 'write';
+            } else {
+                $firstDataFile = mydump_find_file_positional($positionals);
+                if ($firstDataFile !== null) {
+                    $mode = 'write';
+                }
             }
         }
     }
 
     $input = null;
     if ($mode === 'write') {
-        $input = mydump_find_file_positional($positionals);
+        $input = $options['input'] ?: mydump_find_file_positional($positionals);
     }
-    if ($mode === 'dump' && empty($options['output'])) {
-        $maybeOutput = mydump_find_file_positional($positionals);
-        if ($maybeOutput !== null) {
-            $options['output'] = $maybeOutput;
+
+    if ($mode === 'dump') {
+        $collected = [];
+        foreach ($options['outputs'] as $out) {
+            $collected[] = $out;
+        }
+        if (!empty($options['json_output'])) {
+            $collected[] = (string) $options['json_output'];
+        }
+        if (!empty($options['xlsx_output'])) {
+            $collected[] = (string) $options['xlsx_output'];
+        }
+
+        // In explicit dump mode, allow positional output files too.
+        if ($command === 'dump') {
+            foreach (mydump_find_file_positionals($positionals) as $out) {
+                $collected[] = $out;
+            }
+        }
+
+        $options['outputs'] = mydump_unique_values($collected);
+        if (empty($options['output']) && !empty($options['outputs'])) {
+            $options['output'] = $options['outputs'][0];
         }
     }
 
@@ -109,27 +148,38 @@ function mydump_parse_cli(array $argv): array
 function mydump_print_usage(): void
 {
     $usage = <<<TXT
-mydump - MySQL structure <-> JSON/XLSX
+mydump - MySQL schema <-> JSON/XLSX
 
 Usage:
-  php mydump.php dump -o output.xlsx [options]
-  php mydump.php dump -o output.json [options]
-  php mydump.php write input.xlsx [options]
-  php mydump.php write input.json [options]
+  php mydump.php dump [output options] [connection options]
+  php mydump.php write <input.xlsx|input.json|input.js> [connection options]
 
 Shortcuts:
-  php mydump.php -o output.xlsx [options]      # same as dump
-  php mydump.php input.xlsx [options]          # same as write
+  php mydump.php -o schema.xlsx [connection options]      # same as dump
+  php mydump.php schema.xlsx [connection options]         # same as write
 
-Options:
-  -host <host>        MySQL host (default 127.0.0.1)
-  -port <port>        MySQL port (default 3306)
-  -user <user>        MySQL user (default root)
-  -pass <password>    MySQL password
-  -db <database>      Database name
-  -o <file>           Output file in dump mode (.xlsx/.json/.js)
-  --run               In write mode, skip confirmation prompt before ALTER
-  -help               Show this message
+Dump output options:
+  -o, --output <file>     Output file; repeatable (use multiple times)
+  --json <file>           Explicit JSON output file
+  --xlsx <file>           Explicit XLSX output file
+
+Examples:
+  php mydump.php dump -o schema.json
+  php mydump.php dump -o schema.json -o schema.xlsx
+  php mydump.php dump --json schema.json --xlsx schema.xlsx
+
+Connection options:
+  -host <host>            MySQL host (default 127.0.0.1)
+  -port <port>            MySQL port (default 3306)
+  -user <user>            MySQL user (default root)
+  -pass <password>        MySQL password
+  -db <database>          Database name
+
+Write mode options:
+  --run                   Skip confirmation prompt before ALTER statements
+
+General:
+  -help, --help, help     Show this message
 TXT;
 
     fwrite(STDOUT, $usage . PHP_EOL);
@@ -203,37 +253,76 @@ function mydump_option_flag(array $options, array $aliases): bool
 {
     foreach ($aliases as $alias) {
         $key = strtolower($alias);
-        if (array_key_exists($key, $options)) {
-            $value = $options[$key];
+        if (!isset($options[$key])) {
+            continue;
+        }
+
+        foreach ((array) $options[$key] as $value) {
             if (is_bool($value)) {
-                return $value;
+                if ($value) {
+                    return true;
+                }
+                continue;
             }
+
             $text = strtolower((string) $value);
             if ($text === '' || $text === '1' || $text === 'true' || $text === 'yes' || $text === 'on') {
                 return true;
             }
         }
     }
+
     return false;
 }
 
 function mydump_option_value(array $options, array $aliases): ?string
 {
+    $all = mydump_option_values($options, $aliases);
+    if (empty($all)) {
+        return null;
+    }
+    return $all[count($all) - 1];
+}
+
+function mydump_option_values(array $options, array $aliases): array
+{
+    $values = [];
     foreach ($aliases as $alias) {
         $key = strtolower($alias);
-        if (array_key_exists($key, $options)) {
-            $value = $options[$key];
+        if (!isset($options[$key])) {
+            continue;
+        }
+
+        foreach ((array) $options[$key] as $value) {
             if ($value === true || $value === null) {
-                return null;
+                continue;
             }
-            return (string) $value;
+            $text = trim((string) $value);
+            if ($text === '') {
+                continue;
+            }
+
+            // Allow comma-separated output values in a single option.
+            $parts = array_map('trim', explode(',', $text));
+            foreach ($parts as $part) {
+                if ($part !== '') {
+                    $values[] = $part;
+                }
+            }
         }
     }
-    return null;
+    return $values;
 }
 
 function mydump_find_file_positional(array $positionals): ?string
 {
+    $all = mydump_find_file_positionals($positionals);
+    return $all[0] ?? null;
+}
+
+function mydump_find_file_positionals(array $positionals): array
+{
+    $files = [];
     foreach ($positionals as $value) {
         $candidate = (string) $value;
         if ($candidate === '') {
@@ -241,8 +330,31 @@ function mydump_find_file_positional(array $positionals): ?string
         }
         $ext = strtolower((string) pathinfo($candidate, PATHINFO_EXTENSION));
         if (in_array($ext, ['xlsx', 'json', 'js'], true)) {
-            return $candidate;
+            $files[] = $candidate;
         }
     }
-    return null;
+    return mydump_unique_values($files);
+}
+
+function mydump_unique_values(array $values): array
+{
+    $seen = [];
+    $result = [];
+
+    foreach ($values as $value) {
+        $text = trim((string) $value);
+        if ($text === '') {
+            continue;
+        }
+
+        $key = strtolower($text);
+        if (isset($seen[$key])) {
+            continue;
+        }
+
+        $seen[$key] = true;
+        $result[] = $text;
+    }
+
+    return $result;
 }
