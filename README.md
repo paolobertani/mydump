@@ -1,136 +1,118 @@
-![mydump](mydump.png)
-
-&nbsp;
-
 # mydump
 
-`mydump.php` dumps a MySQL schema to `.xlsx` or `.json/.js`, and can read the same file back to create/alter a database.
+`mydump.php` is a TSV-only MySQL schema tool.
 
-Dump the database structure, edit it with Miscrosoft Excel, import it back applying the required *alter*ings.
+It has two modes in one file:
 
-&nbsp;
+- `read`: dump a schema to one flat `.tsv`
+- `write`: read that `.tsv` back and create or alter tables
 
-## Features
+The older `mydump-old.php` is only a historical backup.
 
-Support for `.json` and `.xlsx` for input and output data format.
+All MySQL connection properties must now be passed via shell args.
 
-No dependencies.
-
-In dump mode you can write multiple outputs in one run (for example JSON and XLSX together).
-
-&nbsp;
+No local PHP config file is loaded by `mydump.php`.
 
 ## Requirements
 
 - PHP 8+
+- MySQL/MariaDB access for the target database
 
-&nbsp;
-
-## Connection Parameter Resolution
-
-Order used by the tool:
-
-1. Hard-coded constants (if present)
-2. CLI args
-3. Interactive prompt
-
-Supported args:
-
-- `-host` (default `127.0.0.1`)
-- `-port` (default `3306`)
-- `-user` (default `root`)
-- `-pass`
-- `-db`
-- `-o` / `--output` (dump output file, repeatable)
-- `--json` (explicit JSON output path)
-- `--xlsx` (explicit XLSX output path)
-- `--run` (write mode: skip confirmation)
-
-&nbsp;
-
-## Usage
-
-### Dump mode
+## Commands
 
 ```bash
-php mydump.php dump -o schema.xlsx -db mydb -user root -pass secret
-php mydump.php dump -o schema.json -db mydb
-php mydump.php dump -o schema.json -o schema.xlsx -db mydb
-php mydump.php dump --json schema.json --xlsx schema.xlsx -db mydb
+php mydump.php read  -host localhost -port 3306 -user root -pass secret -db kalei -o kalei.tsv
+php mydump.php write kalei.tsv -host localhost -port 3306 -user root -pass secret -db test
+php mydump.php dump  -host localhost -port 3306 -user root -pass secret -db kalei -o kalei.tsv
+php mydump.php --help
+php mydump.php --version
 ```
 
-Shortcut:
+Shortcuts:
 
-```bash
-php mydump.php -o schema.xlsx -db mydb
-```
+- `php mydump.php -host localhost -port 3306 -user root -pass secret -db kalei -o out.tsv` is the same as `read`
+- `php mydump.php in.tsv -host localhost -port 3306 -user root -pass secret -db test` is the same as `write`
 
-### Write mode
+Common options:
 
-```bash
-php mydump.php write schema.xlsx -db mydb -user root -pass secret
-php mydump.php write schema.json -db mydb --run
-```
+- `-host <host>` MySQL host
+- `-port <port>` MySQL port
+- `-user <user>` MySQL user
+- `-pass <password>` MySQL password
+- `-db <database>` Database name
+- `--run` write mode only, skip the confirmation prompt
 
-Shortcut:
+All five connection args are required on every real `read` and `write` invocation.
 
-```bash
-php mydump.php schema.xlsx -db mydb
-```
+## TSV Format
 
-&nbsp;
+One long list, one row per field.
 
-## XLSX Layout
+Columns:
 
-- One worksheet per table/view.
-- Row 1 is the header.
-- Each following row is one field definition.
-
-Columns written by `dump`:
-
-- `kind`
-- `table_name`
-- `field_name`
-- `position`
-- `column_type`
-- `nullable`
-- `default_kind`
-- `default_value`
-- `extra`
-- `key`
+- `tv` `T` for table, `V` for view
+- `table` table name
+- `eng` engine code, `IDB` or `MEM`
+- `name` field name
+- `type` data type, with `u.` prefixed on unsigned numeric types
+- `length` text/binary size
+- `properties` comma-separated `PK`, `NN`, `UK`, `AI`
+- `index` `Y`, `HA`, or blank
 - `collation`
+- `default`
 - `comment`
-- `generation_expression`
-- `indexes_json`
-- `table_engine`
-- `table_collation`
-- `create_sql`
 
-Cell font style applied in XLSX output:
+Rules:
 
-```json
-{
-  "color": "#000",
-  "font-family": "monaco",
-  "font-size": 12
-}
+- Table and engine values repeat on every row for that object.
+- Indexes are stored as single-column indexes only.
+- If a table has a multi-column index, foreign key, check constraint, generated column, table comment, unsupported engine, or other metadata the TSV cannot fully represent, `read` emits a warning.
+- Views are dumped as rows, but `write` does not recreate view definitions.
+
+## Read
+
+`read` connects to a database and writes one TSV file.
+
+It flattens each table/view into field rows and repeats table-level values on every row.
+
+Examples:
+
+```bash
+php mydump.php read -host localhost -port 3306 -user root -pass secret -db kalei -o kalei.tsv
+php mydump.php -host localhost -port 3306 -user root -pass secret -db kalei -o kalei.tsv
 ```
 
-&nbsp;
+## Write
 
-## JSON Structure
+`write` reads a TSV file and applies it to the target database.
 
-Top-level keys:
+It can create missing tables, alter existing tables, and create the database if needed.
 
-- `database`
-- `objects`
+Examples:
 
-Each object contains:
+```bash
+php mydump.php write kalei.tsv -host localhost -port 3306 -user root -pass secret -db test
+php mydump.php kalei.tsv -host localhost -port 3306 -user root -pass secret -db test --run
+```
 
-- `name`
-- `type` (`table` or `view`)
-- `engine`
-- `collation`
-- `create_sql`
-- `fields`
-- `indexes`
+## Round-Trip Notes
+
+- The TSV is intentionally flat, so only the schema parts that fit the column model round-trip cleanly.
+- Ordinary single-column indexes are supported.
+- Multi-column indexes are reduced to per-column warnings, not reconstructed automatically.
+- Foreign keys and other table-level features are reported as warnings during `read`.
+- Keep the TSV sorted and edited carefully if you want clean diffs between exports.
+
+## Example Flow
+
+```bash
+php mydump.php read -host localhost -port 3306 -user root -pass secret -db kalei -o kalei.tsv
+# edit kalei.tsv
+php mydump.php write kalei.tsv -host localhost -port 3306 -user root -pass secret -db test
+php mydump.php read -host localhost -port 3306 -user root -pass secret -db test -o test.tsv
+# edit test.tsv to test-edited.tsv
+php mydump.php write test-edited.tsv -host localhost -port 3306 -user root -pass secret -db test --run
+php mydump.php read -host localhost -port 3306 -user root -pass secret -db test -o test-altered.tsv
+```
+
+If `test-edited.tsv` and `test-altered.tsv` differ, the gap is in the schema features the TSV cannot express exactly or in the manual edits made between the two imports.

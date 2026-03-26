@@ -2,300 +2,558 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/src/argv.php';
-require_once __DIR__ . '/src/xlsx.php';
+const MYDUMP_VERSION = '0.9';
 
-mydump_main($argv);
+if (realpath((string) ($_SERVER['SCRIPT_FILENAME'] ?? '')) === __FILE__) {
+    mydump_main($argv);
+}
 
+/**
+ * Coordinate the whole command-line tool: parse the shell arguments, decide
+ * whether the user wants the read or write program, and route execution into
+ * the chosen half of the file while keeping all fatal errors user-friendly.
+ */
 function mydump_main(array $argv): void
 {
     try {
-        mydump_include_kalei();
-
         $cli = mydump_parse_cli($argv);
-        if (($cli['options']['help'] ?? false) === true) {
+        if ($cli['options']['version'] === true) {
+            fwrite(STDOUT, 'mydump ' . MYDUMP_VERSION . PHP_EOL);
+            return;
+        }
+        if ($cli['help'] === true) {
             mydump_print_usage();
             return;
         }
 
         $mode = $cli['mode'];
-        if ($mode !== 'dump' && $mode !== 'write') {
-            $modeInput = strtolower(mydump_prompt('Mode (dump/write)', 'dump', true));
-            $mode = $modeInput === 'write' ? 'write' : 'dump';
+        if ($mode === null) {
+            $modeInput = strtolower(mydump_prompt('Mode (read/write)', 'read', true));
+            $mode = ($modeInput === 'write') ? 'write' : 'read';
         }
 
-        if ($mode === 'dump') {
-            mydump_run_dump_mode($cli);
+        if ($mode === 'read') {
+            mydump_run_read_program($cli);
             return;
         }
 
-        mydump_run_write_mode($cli);
-    } catch (Throwable $e) {
-        fwrite(STDERR, 'Error: ' . $e->getMessage() . PHP_EOL);
+        mydump_run_write_program($cli);
+    } catch (Throwable $throwable) {
+        fwrite(STDERR, 'Error: ' . $throwable->getMessage() . PHP_EOL);
         exit(1);
     }
 }
 
-function mydump_run_dump_mode(array $cli): void
+/**
+ * Parse the historical `mydump` shell syntax, preserve its old shortcuts and
+ * defaults where they still make sense, and reduce everything to one compact
+ * structure that both programs can consume without sharing any later logic.
+ */
+function mydump_parse_cli(array $argv): array
 {
-    $options = $cli['options'];
-    $targets = mydump_resolve_dump_targets($cli);
+    $tokens = $argv;
+    array_shift($tokens);
 
-    $conn = mydump_resolve_connection($options, null);
-
-    $pdo = mydump_connect_server($conn, false);
-    if (!mydump_database_exists($pdo, $conn['db'])) {
-        throw new RuntimeException("Database '{$conn['db']}' does not exist.");
+    $command = null;
+    if (isset($tokens[0])) {
+        $head = strtolower((string) $tokens[0]);
+        if (in_array($head, ['read', 'write', 'dump'], true)) {
+            $command = ($head === 'dump') ? 'read' : $head;
+            array_shift($tokens);
+        } elseif ($head === 'help') {
+            $command = 'help';
+            array_shift($tokens);
+        }
     }
 
-    $schema = mydump_fetch_schema($pdo, $conn['db']);
+    $rawOptions = [];
+    $positionals = [];
+    $flagOptions = ['run', 'help', '?'];
 
-    foreach ($targets as $target) {
-        mydump_write_schema_file($schema, $target['path'], $target['format']);
-        fwrite(STDOUT, 'Dump complete: ' . $target['path'] . PHP_EOL);
+    for ($index = 0, $count = count($tokens); $index < $count; $index++) {
+        $token = (string) $tokens[$index];
+
+        if ($token === '--') {
+            for ($tailIndex = $index + 1; $tailIndex < $count; $tailIndex++) {
+                $positionals[] = (string) $tokens[$tailIndex];
+            }
+            break;
+        }
+
+        if ($token === '' || $token === '-' || $token[0] !== '-') {
+            $positionals[] = $token;
+            continue;
+        }
+
+        $trimmed = ltrim($token, '-');
+        if ($trimmed === '') {
+            $positionals[] = $token;
+            continue;
+        }
+
+        $name = strtolower($trimmed);
+        $value = true;
+
+        if (str_contains($trimmed, '=')) {
+            [$nameRaw, $valueRaw] = explode('=', $trimmed, 2);
+            $name = strtolower($nameRaw);
+            $value = (string) $valueRaw;
+        } elseif (!in_array($name, $flagOptions, true)) {
+            $next = $tokens[$index + 1] ?? null;
+            if ($next !== null && (string) $next !== '--' && !str_starts_with((string) $next, '-')) {
+                $value = (string) $next;
+                $index++;
+            } else {
+                $value = null;
+            }
+        }
+
+        if (!isset($rawOptions[$name])) {
+            $rawOptions[$name] = [];
+        }
+        $rawOptions[$name][] = $value;
     }
 
-    if (count($targets) > 1) {
-        fwrite(STDOUT, 'Wrote ' . count($targets) . ' output files.' . PHP_EOL);
+    $options = [
+        'host' => mydump_option_value($rawOptions, ['host']),
+        'port' => mydump_option_value($rawOptions, ['port']),
+        'user' => mydump_option_value($rawOptions, ['user']),
+        'pass' => mydump_option_value($rawOptions, ['pass', 'password']),
+        'pass_provided' => mydump_option_present($rawOptions, ['pass', 'password']),
+        'db' => mydump_option_value($rawOptions, ['db', 'database']),
+        'input' => mydump_option_value($rawOptions, ['i', 'input']),
+        'output' => mydump_option_value($rawOptions, ['o', 'output']),
+        'outputs' => mydump_option_values($rawOptions, ['o', 'output']),
+        'run' => mydump_option_flag($rawOptions, ['run']),
+        'version' => mydump_option_flag($rawOptions, ['version', 'v']),
+        'help' => $command === 'help' || mydump_option_flag($rawOptions, ['help', '?']),
+        'positionals' => $positionals,
+    ];
+
+    $mode = null;
+    if ($command === 'read' || $command === 'write') {
+        $mode = $command;
+    }
+
+    if ($mode === null && $options['help'] !== true) {
+        if (!empty($options['outputs'])) {
+            $mode = 'read';
+        } elseif (!empty($options['input'])) {
+            $mode = 'write';
+        } elseif (mydump_find_tsv_positional($positionals) !== null) {
+            $mode = 'write';
+        }
+    }
+
+    $inputPath = null;
+    if ($mode === 'write') {
+        $inputPath = $options['input'] ?: mydump_find_tsv_positional($positionals);
+    }
+
+    $outputPath = null;
+    if ($mode === 'read') {
+        $outputCandidates = $options['outputs'];
+        if ($command === 'read') {
+            foreach (mydump_find_tsv_positionals($positionals) as $candidate) {
+                $outputCandidates[] = $candidate;
+            }
+        }
+
+        $outputCandidates = mydump_unique_values($outputCandidates);
+        if (!empty($outputCandidates)) {
+            $outputPath = $outputCandidates[count($outputCandidates) - 1];
+        } elseif (!empty($options['output'])) {
+            $outputPath = $options['output'];
+        }
+    }
+
+    return [
+        'mode' => $mode,
+        'command' => $command,
+        'version' => $options['version'],
+        'help' => $options['help'],
+        'options' => $options,
+        'input' => $inputPath,
+        'output' => $outputPath,
+    ];
+}
+
+/**
+ * Print the user-facing help text for the new TSV-only tool, documenting the
+ * canonical `read`/`write` flow while also calling out the compatibility alias
+ * and shortcuts that were inherited from the older version of `mydump`.
+ */
+function mydump_print_usage(): void
+{
+    $usage = <<<TXT
+mydump 0.9
+read:  php mydump.php read -host H -port P -user U -pass PW -db DB -o out.tsv
+write: php mydump.php write in.tsv -host H -port P -user U -pass PW -db DB
+conn:  shell args only, no local config include
+help:  php mydump.php --help
+ver:   php mydump.php --version
+TXT;
+
+    fwrite(STDOUT, $usage . PHP_EOL);
+}
+
+/**
+ * Prompt the user for a normal text value when the historical CLI contract
+ * expects interactive fallback, including optional defaults and retrying when
+ * the field is required and the user submits an empty answer.
+ */
+function mydump_prompt(string $label, ?string $default = null, bool $required = true): string
+{
+    while (true) {
+        $suffix = ($default !== null && $default !== '') ? " [{$default}]" : '';
+        $value = mydump_readline($label . $suffix . ': ');
+        if ($value === '' && $default !== null) {
+            return $default;
+        }
+        if ($required === false || $value !== '') {
+            return $value;
+        }
     }
 }
 
-function mydump_resolve_dump_targets(array $cli): array
+/**
+ * Ask a yes/no question using the old command-line style, interpret blank
+ * answers according to the requested default, and return a strict boolean that
+ * later code can use without any additional string parsing.
+ */
+function mydump_confirm(string $question, bool $defaultNo = true): bool
 {
-    $options = $cli['options'] ?? [];
-    $candidates = [];
+    $suffix = $defaultNo ? ' [y/N]: ' : ' [Y/n]: ';
+    $value = strtolower(trim(mydump_readline($question . $suffix)));
 
-    foreach ((array) ($options['outputs'] ?? []) as $output) {
-        $candidates[] = (string) $output;
-    }
-    if (empty($candidates) && !empty($options['output'])) {
-        $candidates[] = (string) $options['output'];
+    if ($value === '') {
+        return !$defaultNo;
     }
 
-    if (empty($candidates)) {
-        $line = mydump_prompt('Output file(s) (.xlsx/.json/.js, comma-separated)', null, true);
-        foreach (array_map('trim', explode(',', $line)) as $part) {
-            if ($part !== '') {
-                $candidates[] = $part;
+    return in_array($value, ['y', 'yes'], true);
+}
+
+/**
+ * Read a single line from the terminal, preferring PHP's readline support when
+ * it is available and falling back to standard input so the script keeps
+ * working in plain shells and minimal PHP installations.
+ */
+function mydump_readline(string $prompt): string
+{
+    if (function_exists('readline')) {
+        $line = readline($prompt);
+        if ($line === false) {
+            return '';
+        }
+        return trim($line);
+    }
+
+    fwrite(STDOUT, $prompt);
+    $line = fgets(STDIN);
+    if ($line === false) {
+        return '';
+    }
+
+    return trim($line);
+}
+
+/**
+ * Resolve boolean flags from the raw option bag, accepting both bare flags and
+ * the common truthy textual forms so the parser remains forgiving in the same
+ * spirit as the older version of the tool.
+ */
+function mydump_option_flag(array $options, array $aliases): bool
+{
+    foreach ($aliases as $alias) {
+        $key = strtolower($alias);
+        if (!isset($options[$key])) {
+            continue;
+        }
+
+        foreach ((array) $options[$key] as $value) {
+            if (is_bool($value)) {
+                if ($value === true) {
+                    return true;
+                }
+                continue;
+            }
+
+            $text = strtolower((string) $value);
+            if ($text === '' || in_array($text, ['1', 'true', 'yes', 'on'], true)) {
+                return true;
             }
         }
     }
 
-    if (empty($candidates)) {
-        throw new RuntimeException('At least one output file is required in dump mode.');
+    return false;
+}
+
+/**
+ * Resolve the last non-empty scalar value for an option alias set, which keeps
+ * the parser predictable when the same option is supplied multiple times and
+ * matches the "last one wins" convention used by many CLI tools.
+ */
+function mydump_option_value(array $options, array $aliases): ?string
+{
+    $values = mydump_option_values($options, $aliases);
+    if (empty($values)) {
+        return null;
     }
 
-    $unique = [];
-    $seen = [];
-    foreach ($candidates as $candidate) {
-        $path = trim((string) $candidate);
-        if ($path === '') {
+    return $values[count($values) - 1];
+}
+
+/**
+ * Collect all non-empty option values for one alias set, also splitting simple
+ * comma-separated lists so the `-o a.tsv,b.tsv` style inherited from the older
+ * code path still behaves sensibly even though the new format uses one file.
+ */
+function mydump_option_values(array $options, array $aliases): array
+{
+    $values = [];
+
+    foreach ($aliases as $alias) {
+        $key = strtolower($alias);
+        if (!isset($options[$key])) {
             continue;
         }
 
-        $key = strtolower($path);
+        foreach ((array) $options[$key] as $value) {
+            if ($value === true || $value === null) {
+                continue;
+            }
+
+            $text = trim((string) $value);
+            if ($text === '') {
+                continue;
+            }
+
+            foreach (array_map('trim', explode(',', $text)) as $part) {
+                if ($part !== '') {
+                    $values[] = $part;
+                }
+            }
+        }
+    }
+
+    return $values;
+}
+
+/**
+ * Detect whether any alias in one option family was provided at all, even when
+ * the user intentionally supplied an empty value such as `-pass=` for a blank
+ * password that still needs to count as an explicit shell argument.
+ */
+function mydump_option_present(array $options, array $aliases): bool
+{
+    foreach ($aliases as $alias) {
+        if (array_key_exists(strtolower($alias), $options)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Return the first positional argument that looks like a TSV path so the write
+ * shortcut `php mydump.php schema.tsv` continues to work without needing an
+ * explicit `write` command or `--input` flag.
+ */
+function mydump_find_tsv_positional(array $positionals): ?string
+{
+    $values = mydump_find_tsv_positionals($positionals);
+    return $values[0] ?? null;
+}
+
+/**
+ * Return every positional argument that ends in `.tsv`, which lets the parser
+ * reuse the same simple file-detection rule for both the write shortcut and
+ * the explicit read-mode positional output convenience.
+ */
+function mydump_find_tsv_positionals(array $positionals): array
+{
+    $matches = [];
+
+    foreach ($positionals as $value) {
+        $candidate = trim((string) $value);
+        if ($candidate === '') {
+            continue;
+        }
+
+        $extension = strtolower((string) pathinfo($candidate, PATHINFO_EXTENSION));
+        if ($extension === 'tsv') {
+            $matches[] = $candidate;
+        }
+    }
+
+    return mydump_unique_values($matches);
+}
+
+/**
+ * Deduplicate a list of textual values case-insensitively while preserving the
+ * original order, which is useful for shell arguments where later processing
+ * still wants stable and human-intuitive ordering.
+ */
+function mydump_unique_values(array $values): array
+{
+    $seen = [];
+    $result = [];
+
+    foreach ($values as $value) {
+        $text = trim((string) $value);
+        if ($text === '') {
+            continue;
+        }
+
+        $key = strtolower($text);
         if (isset($seen[$key])) {
             continue;
         }
 
-        $format = mydump_detect_format($path);
-        if ($format === null) {
-            throw new RuntimeException("Unsupported output extension for '{$path}'. Use .xlsx, .json or .js");
-        }
-
         $seen[$key] = true;
-        $unique[] = [
-            'path' => $path,
-            'format' => $format,
-        ];
+        $result[] = $text;
     }
 
-    if (empty($unique)) {
-        throw new RuntimeException('At least one valid output file is required in dump mode.');
-    }
-
-    return $unique;
+    return $result;
 }
 
-function mydump_run_write_mode(array $cli): void
+// ---------------------------------------------------------------------------
+// mydump-read
+// ---------------------------------------------------------------------------
+
+/**
+ * Execute the read half of the tool: connect to MySQL, inspect the current
+ * schema, flatten it into the new TSV row model, emit warnings for every table
+ * feature the TSV cannot preserve, and finally write the output file.
+ */
+function mydump_run_read_program(array $cli): void
 {
-    $options = $cli['options'];
-    $inputFile = (string) ($cli['input'] ?? '');
-    if ($inputFile === '') {
-        $inputFile = mydump_prompt('Input file (.xlsx/.json/.js)', null, true);
+    $outputPath = mydump_read_resolve_output_path($cli);
+    $connection = mydump_read_resolve_connection($cli['options']);
+    $pdo = mydump_read_connect_server($connection, false);
+
+    if (!mydump_read_database_exists($pdo, $connection['db'])) {
+        throw new RuntimeException("Database '{$connection['db']}' does not exist.");
     }
 
-    if (!is_file($inputFile)) {
-        throw new RuntimeException("Input file not found: {$inputFile}");
-    }
+    $pdo->exec('USE ' . mydump_read_quote_identifier($connection['db']));
 
-    $format = mydump_detect_format($inputFile);
-    if ($format === null) {
-        throw new RuntimeException('Unsupported input extension. Use .xlsx, .json or .js');
-    }
+    $objects = mydump_read_fetch_objects($pdo, $connection['db']);
+    $rows = [];
+    $warnings = [];
 
-    $schema = mydump_read_schema_file($inputFile, $format);
-    $schemaDb = mydump_schema_database_name($schema);
-    $conn = mydump_resolve_connection($options, $schemaDb);
+    foreach ($objects as $object) {
+        $columnRows = mydump_read_fetch_object_rows($pdo, $connection['db'], $object);
+        foreach ($columnRows as $row) {
+            $rows[] = $row;
+        }
 
-    $pdo = mydump_connect_server($conn, false);
-
-    $dbExists = mydump_database_exists($pdo, $conn['db']);
-    if (!$dbExists) {
-        $dbMeta = $schema['database'] ?? [];
-        $charset = (string) ($dbMeta['default_character_set'] ?? 'utf8mb4');
-        $collation = (string) ($dbMeta['default_collation'] ?? 'utf8mb4_unicode_ci');
-        mydump_create_database($pdo, $conn['db'], $charset, $collation);
-        fwrite(STDOUT, "Created database `{$conn['db']}`" . PHP_EOL);
-    }
-
-    $pdo->exec('USE ' . mydump_quote_identifier($conn['db']));
-
-    $plan = mydump_build_write_plan($pdo, $conn['db'], $schema);
-
-    if ($dbExists && !$options['run'] && !empty($plan['statements'])) {
-        $ok = mydump_confirm(
-            "Database `{$conn['db']}` already exists. Apply " . count($plan['statements']) . ' statement(s)?',
-            true
-        );
-        if (!$ok) {
-            fwrite(STDOUT, 'Aborted by user.' . PHP_EOL);
-            return;
+        $objectWarnings = mydump_read_collect_object_warnings($pdo, $connection['db'], $object);
+        foreach ($objectWarnings as $warning) {
+            $warnings[] = $warning;
         }
     }
 
-    if (empty($plan['statements'])) {
-        fwrite(STDOUT, 'No changes required.' . PHP_EOL);
-        return;
-    }
+    mydump_read_write_tsv($outputPath, $rows);
+    mydump_read_emit_warnings($warnings);
 
-    foreach ($plan['statements'] as $stmt) {
-        $sql = (string) $stmt['sql'];
-        $pdo->exec($sql);
-        fwrite(STDOUT, '[OK] ' . $sql . PHP_EOL);
-    }
-
-    fwrite(STDOUT, 'Write complete.' . PHP_EOL);
-}
-
-function mydump_include_kalei(): void
-{
-    $kaleiPath = __DIR__ . DIRECTORY_SEPARATOR . 'kalei.php';
-    if (is_file($kaleiPath)) {
-        require_once $kaleiPath;
+    fwrite(STDOUT, 'Read complete: ' . $outputPath . PHP_EOL);
+    if (!empty($warnings)) {
+        fwrite(STDOUT, 'Warnings: ' . count($warnings) . PHP_EOL);
     }
 }
 
-function mydump_resolve_connection(array $options, ?string $dbDefault): array
+/**
+ * Resolve and validate the TSV output path for the read program, preserving
+ * the old interactive fallback and explicitly rejecting multiple outputs now
+ * that the new format intentionally produces exactly one flattened file.
+ */
+function mydump_read_resolve_output_path(array $cli): string
 {
-    $constants = mydump_detect_connection_constants();
-
-    $host = mydump_pick_value($constants['host'], $options['host'] ?? null, '127.0.0.1');
-    $port = mydump_pick_value($constants['port'], $options['port'] ?? null, '3306');
-    $user = mydump_pick_value($constants['user'], $options['user'] ?? null, 'root');
-
-    $passFromConstOrArg = mydump_pick_value($constants['pass'], $options['pass'] ?? null, null);
-    if ($passFromConstOrArg === null) {
-        $passFromConstOrArg = mydump_prompt_secret('MySQL password (leave empty for none)');
+    $outputs = mydump_read_unique_values((array) ($cli['options']['outputs'] ?? []));
+    if (count($outputs) > 1) {
+        throw new RuntimeException('Read mode now supports exactly one TSV output file.');
     }
 
-    $db = mydump_pick_value($constants['db'], $options['db'] ?? null, $dbDefault);
-    if ($db === null || trim($db) === '') {
-        $db = mydump_prompt('Database name', $dbDefault, true);
+    $outputPath = trim((string) ($cli['output'] ?? ''));
+    if ($outputPath === '') {
+        $outputPath = mydump_prompt('Output file (.tsv)', null, true);
     }
 
-    $port = trim((string) $port);
-    while (!ctype_digit($port) || (int) $port < 1 || (int) $port > 65535) {
-        $port = mydump_prompt('MySQL port', '3306', true);
+    if (strtolower((string) pathinfo($outputPath, PATHINFO_EXTENSION)) !== 'tsv') {
+        throw new RuntimeException('Read mode output must end in .tsv');
+    }
+
+    $directory = dirname($outputPath);
+    if (!is_dir($directory)) {
+        throw new RuntimeException("Directory does not exist: {$directory}");
+    }
+
+    return $outputPath;
+}
+
+/**
+ * Resolve the read-side MySQL connection strictly from explicit shell args,
+ * because the tool is now intentionally literal single-file only and no longer
+ * reads local PHP config files or connection constants from elsewhere.
+ */
+function mydump_read_resolve_connection(array $options): array
+{
+    $host = mydump_read_require_shell_connection_value('-host', $options['host'] ?? null);
+    $portText = mydump_read_require_shell_connection_value('-port', $options['port'] ?? null);
+    $user = mydump_read_require_shell_connection_value('-user', $options['user'] ?? null);
+    $database = mydump_read_require_shell_connection_value('-db', $options['db'] ?? null);
+
+    $password = $options['pass'] ?? null;
+    $passwordProvided = (bool) ($options['pass_provided'] ?? false);
+    if (!$passwordProvided) {
+        throw new RuntimeException('Missing required shell argument: -pass');
+    }
+
+    if (!ctype_digit($portText) || (int) $portText < 1 || (int) $portText > 65535) {
+        throw new RuntimeException('Shell argument -port must be an integer between 1 and 65535.');
     }
 
     return [
-        'host' => (string) $host,
-        'port' => (int) $port,
-        'user' => (string) $user,
-        'pass' => (string) $passFromConstOrArg,
-        'db' => (string) $db,
+        'host' => $host,
+        'port' => (int) $portText,
+        'user' => $user,
+        'pass' => (string) ($password ?? ''),
+        'db' => $database,
     ];
 }
 
-function mydump_pick_value(?string $fromConst, ?string $fromArg, ?string $fallback): ?string
+/**
+ * Require one non-empty shell-supplied connection value for the read program
+ * and fail fast with a precise flag name when a mandatory argument is missing.
+ */
+function mydump_read_require_shell_connection_value(string $flagName, ?string $value): string
 {
-    if ($fromConst !== null && $fromConst !== '') {
-        return $fromConst;
+    $text = trim((string) $value);
+    if ($text === '') {
+        throw new RuntimeException("Missing required shell argument: {$flagName}");
     }
-    if ($fromArg !== null && $fromArg !== '') {
-        return $fromArg;
-    }
-    return $fallback;
+
+    return $text;
 }
 
-function mydump_detect_connection_constants(): array
+/**
+ * Create a PDO connection for the read program using UTF-8 metadata access and
+ * exception-based error handling, optionally attaching a database name when a
+ * specific query path requires it.
+ */
+function mydump_read_connect_server(array $connection, bool $withDatabase): PDO
 {
-    $userConstants = get_defined_constants(true)['user'] ?? [];
-
-    return [
-        'host' => mydump_pick_constant($userConstants, [
-            'DB_HOST', 'MYSQL_HOST', 'DATABASE_HOST', 'DBHOST', 'DB_SERVER', 'SQL_HOST',
-        ], '/(db|mysql|sql).*(host)|(host).*(db|mysql|sql)/i'),
-        'port' => mydump_pick_constant($userConstants, [
-            'DB_PORT', 'MYSQL_PORT', 'DATABASE_PORT', 'DBPORT', 'SQL_PORT',
-        ], '/(db|mysql|sql).*(port)|(port).*(db|mysql|sql)/i'),
-        'user' => mydump_pick_constant($userConstants, [
-            'DB_USER', 'DB_USERNAME', 'MYSQL_USER', 'DATABASE_USER', 'DB_LOGIN', 'SQL_USER',
-        ], '/(db|mysql|sql).*(user|username|login)|(user|username|login).*(db|mysql|sql)/i'),
-        'pass' => mydump_pick_constant($userConstants, [
-            'DB_PASS', 'DB_PASSWORD', 'MYSQL_PASS', 'MYSQL_PASSWORD', 'DATABASE_PASS', 'SQL_PASSWORD',
-        ], '/(db|mysql|sql).*(pass|password)|(pass|password).*(db|mysql|sql)/i'),
-        'db' => mydump_pick_constant($userConstants, [
-            'DB_NAME', 'MYSQL_DB', 'MYSQL_DATABASE', 'DATABASE_NAME', 'DB_DATABASE', 'DB',
-        ], '/(db|database|schema).*(name)?|(name).*(db|database|schema)/i'),
-    ];
-}
-
-function mydump_pick_constant(array $constants, array $preferredNames, string $regex): ?string
-{
-    foreach ($preferredNames as $name) {
-        if (array_key_exists($name, $constants) && is_scalar($constants[$name])) {
-            return trim((string) $constants[$name]);
-        }
-    }
-
-    foreach ($constants as $name => $value) {
-        if (!is_scalar($value)) {
-            continue;
-        }
-        $nameText = (string) $name;
-        if (preg_match($regex, $nameText) === 1) {
-            return trim((string) $value);
-        }
-    }
-
-    return null;
-}
-
-function mydump_detect_format(string $path): ?string
-{
-    $ext = strtolower((string) pathinfo($path, PATHINFO_EXTENSION));
-    if ($ext === 'xlsx') {
-        return 'xlsx';
-    }
-    if ($ext === 'json' || $ext === 'js') {
-        return 'json';
-    }
-    return null;
-}
-
-function mydump_connect_server(array $conn, bool $withDb): PDO
-{
-    $dsn = 'mysql:host=' . $conn['host'] . ';port=' . $conn['port'] . ';charset=utf8mb4';
-    if ($withDb) {
-        $dsn .= ';dbname=' . $conn['db'];
+    $dsn = 'mysql:host=' . $connection['host'] . ';port=' . $connection['port'] . ';charset=utf8mb4';
+    if ($withDatabase) {
+        $dsn .= ';dbname=' . $connection['db'];
     }
 
     return new PDO(
         $dsn,
-        $conn['user'],
-        $conn['pass'],
+        $connection['user'],
+        $connection['pass'],
         [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
@@ -303,1151 +561,2240 @@ function mydump_connect_server(array $conn, bool $withDb): PDO
     );
 }
 
-function mydump_database_exists(PDO $pdo, string $dbName): bool
+/**
+ * Check that the target database exists before the read program attempts any
+ * deeper schema inspection, so later metadata queries can assume the schema is
+ * real and return clearer messages when credentials are otherwise valid.
+ */
+function mydump_read_database_exists(PDO $pdo, string $databaseName): bool
 {
-    $stmt = $pdo->prepare('SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = :db LIMIT 1');
-    $stmt->execute(['db' => $dbName]);
-    return (bool) $stmt->fetchColumn();
+    $statement = $pdo->prepare(
+        'SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = :database LIMIT 1'
+    );
+    $statement->execute(['database' => $databaseName]);
+
+    return (bool) $statement->fetchColumn();
 }
 
-function mydump_create_database(PDO $pdo, string $dbName, string $charset, string $collation): void
+/**
+ * Fetch the list of tables and views that will become top-level TSV groups,
+ * keeping only the metadata the flattened format still needs directly and the
+ * extra table attributes that warning generation must inspect later.
+ */
+function mydump_read_fetch_objects(PDO $pdo, string $databaseName): array
 {
-    if (!preg_match('/^[A-Za-z0-9_]+$/', $charset)) {
+    $statement = $pdo->prepare(
+        'SELECT
+            TABLE_NAME,
+            TABLE_TYPE,
+            ENGINE,
+            TABLE_COLLATION,
+            TABLE_COMMENT
+         FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = :database
+         ORDER BY TABLE_NAME'
+    );
+    $statement->execute(['database' => $databaseName]);
+
+    $objects = [];
+    foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $objects[] = [
+            'name' => (string) ($row['TABLE_NAME'] ?? ''),
+            'tv' => strtoupper((string) ($row['TABLE_TYPE'] ?? '')) === 'VIEW' ? 'V' : 'T',
+            'engine' => (string) ($row['ENGINE'] ?? ''),
+            'table_collation' => (string) ($row['TABLE_COLLATION'] ?? ''),
+            'table_comment' => (string) ($row['TABLE_COMMENT'] ?? ''),
+        ];
+    }
+
+    return $objects;
+}
+
+/**
+ * Build the flattened TSV rows for one table or view by reading ordered column
+ * metadata, deriving the new field-level properties from the schema, and
+ * repeating the table-level values on every row exactly as requested.
+ */
+function mydump_read_fetch_object_rows(PDO $pdo, string $databaseName, array $object): array
+{
+    $columns = mydump_read_fetch_columns($pdo, $databaseName, (string) $object['name']);
+    $indexMap = ($object['tv'] === 'T')
+        ? mydump_read_build_expressible_index_map($pdo, (string) $object['name'])
+        : [];
+
+    $rows = [];
+    foreach ($columns as $column) {
+        $rows[] = mydump_read_build_row($object, $column, $indexMap);
+    }
+
+    return $rows;
+}
+
+/**
+ * Fetch ordered column metadata for one object using information schema, which
+ * gives the read program everything it needs to derive the new TSV columns
+ * without having to parse raw `SHOW CREATE TABLE` SQL.
+ */
+function mydump_read_fetch_columns(PDO $pdo, string $databaseName, string $tableName): array
+{
+    $statement = $pdo->prepare(
+        'SELECT
+            COLUMN_NAME,
+            DATA_TYPE,
+            COLUMN_TYPE,
+            CHARACTER_MAXIMUM_LENGTH,
+            IS_NULLABLE,
+            COLUMN_DEFAULT,
+            EXTRA,
+            COLLATION_NAME,
+            COLUMN_COMMENT,
+            ORDINAL_POSITION,
+            GENERATION_EXPRESSION
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = :database
+           AND TABLE_NAME = :table
+         ORDER BY ORDINAL_POSITION'
+    );
+    $statement->execute([
+        'database' => $databaseName,
+        'table' => $tableName,
+    ]);
+
+    return $statement->fetchAll(PDO::FETCH_ASSOC);
+}
+
+/**
+ * Convert one column plus the already-indexed table metadata into the exact
+ * TSV row layout, including the requested repeated table values and the new
+ * compact encoding for type, properties, index marker, and defaults.
+ */
+function mydump_read_build_row(array $object, array $column, array $indexMap): array
+{
+    $columnName = (string) ($column['COLUMN_NAME'] ?? '');
+    $indexMeta = $indexMap[$columnName] ?? ['properties' => [], 'index' => ''];
+
+    return [
+        'tv' => (string) $object['tv'],
+        'table' => (string) $object['name'],
+        'eng' => mydump_read_resolve_engine_code($object),
+        'name' => $columnName,
+        'type' => mydump_read_encode_type_token($column),
+        'length' => mydump_read_encode_length($column),
+        'properties' => mydump_read_encode_properties($column, $indexMeta),
+        'index' => mydump_read_encode_index_cell($indexMeta),
+        'collation' => (string) ($column['COLLATION_NAME'] ?? ''),
+        'default' => mydump_read_encode_default_cell($column),
+        'comment' => (string) ($column['COLUMN_COMMENT'] ?? ''),
+    ];
+}
+
+/**
+ * Map MySQL engines to the compact `eng` codes required by the TSV, leaving
+ * views blank and warning separately when a table uses an engine outside the
+ * explicit `IDB` / `MEM` vocabulary requested by the new format.
+ */
+function mydump_read_resolve_engine_code(array $object): string
+{
+    if ((string) ($object['tv'] ?? 'T') === 'V') {
+        return '';
+    }
+
+    $engine = strtoupper(trim((string) ($object['engine'] ?? '')));
+    if ($engine === 'INNODB') {
+        return 'IDB';
+    }
+    if ($engine === 'MEMORY' || $engine === 'HEAP') {
+        return 'MEM';
+    }
+
+    return '';
+}
+
+/**
+ * Encode the TSV `type` token by removing the MySQL `unsigned` keyword from
+ * the source type and replacing it with the requested `u.` prefix while also
+ * splitting simple string lengths into the dedicated `length` column.
+ */
+function mydump_read_encode_type_token(array $column): string
+{
+    $dataType = strtolower(trim((string) ($column['DATA_TYPE'] ?? '')));
+    $columnType = trim((string) ($column['COLUMN_TYPE'] ?? ''));
+    $isUnsigned = preg_match('/\bunsigned\b/i', $columnType) === 1;
+    $typeCore = mydump_read_strip_unsigned_keyword($columnType);
+
+    if (mydump_read_is_length_driven_type($dataType)) {
+        $typeCore = $dataType;
+    } elseif ($dataType !== '' && mydump_read_is_simple_type_without_length($dataType)) {
+        $typeCore = $dataType;
+    } elseif ($typeCore === '') {
+        $typeCore = $dataType;
+    }
+
+    if ($isUnsigned && mydump_read_is_unsigned_capable_type($dataType)) {
+        return 'u.' . $typeCore;
+    }
+
+    return $typeCore;
+}
+
+/**
+ * Encode the TSV `length` column only for the string and binary types where
+ * the requested flat format stores size outside the type token, leaving every
+ * other kind of column blank to avoid inventing unsupported semantics.
+ */
+function mydump_read_encode_length(array $column): string
+{
+    $dataType = strtolower(trim((string) ($column['DATA_TYPE'] ?? '')));
+    if (!mydump_read_is_length_driven_type($dataType)) {
+        return '';
+    }
+
+    $length = $column['CHARACTER_MAXIMUM_LENGTH'] ?? null;
+    if ($length === null || $length === '') {
+        return '';
+    }
+
+    return (string) (int) $length;
+}
+
+/**
+ * Build the aggregated `properties` cell from both column metadata and the
+ * single-column index map so PK, NN, UK, and AI end up in a stable, compact,
+ * comma-separated order on every TSV row.
+ */
+function mydump_read_encode_properties(array $column, array $indexMeta): string
+{
+    $properties = [];
+
+    if (($indexMeta['properties']['PK'] ?? false) === true) {
+        $properties[] = 'PK';
+    }
+
+    $isNotNull = strtoupper((string) ($column['IS_NULLABLE'] ?? 'YES')) !== 'YES';
+    if ($isNotNull) {
+        $properties[] = 'NN';
+    }
+
+    if (($indexMeta['properties']['UK'] ?? false) === true) {
+        $properties[] = 'UK';
+    }
+
+    $extra = strtolower((string) ($column['EXTRA'] ?? ''));
+    if (str_contains($extra, 'auto_increment')) {
+        $properties[] = 'AI';
+    }
+
+    return implode(',', $properties);
+}
+
+/**
+ * Convert the normalized index metadata into the requested TSV marker: blank
+ * when there is no ordinary non-unique index, `Y` for BTREE-like indexes, and
+ * `HA` specifically for the single-column HASH case.
+ */
+function mydump_read_encode_index_cell(array $indexMeta): string
+{
+    return (string) ($indexMeta['index'] ?? '');
+}
+
+/**
+ * Convert MySQL defaults into an editable TSV form that aims to be concise for
+ * humans while still round-tripping through the write program: blank for no
+ * default, `NULL` for nullable-null defaults, and raw literals or expressions
+ * for everything else.
+ */
+function mydump_read_encode_default_cell(array $column): string
+{
+    $defaultValue = $column['COLUMN_DEFAULT'] ?? null;
+    $dataType = strtolower(trim((string) ($column['DATA_TYPE'] ?? '')));
+    $isNullable = strtoupper((string) ($column['IS_NULLABLE'] ?? 'YES')) === 'YES';
+    $extra = (string) ($column['EXTRA'] ?? '');
+
+    if ($defaultValue === null) {
+        return $isNullable ? 'NULL' : '';
+    }
+
+    $defaultText = (string) $defaultValue;
+    if (mydump_read_is_default_expression($defaultText, $extra)) {
+        return $defaultText;
+    }
+
+    if ($defaultText === '') {
+        return "''";
+    }
+
+    if (mydump_read_is_string_like_type($dataType)) {
+        return $defaultText;
+    }
+
+    if (mydump_read_is_temporal_type($dataType)) {
+        return $defaultText;
+    }
+
+    if (mydump_read_is_unsigned_capable_type($dataType) && is_numeric($defaultText)) {
+        return $defaultText;
+    }
+
+    return $defaultText;
+}
+
+/**
+ * Detect default expressions that must be preserved as SQL fragments instead
+ * of quoted literals, covering the common server-generated expressions MySQL
+ * exposes through information schema and the `DEFAULT_GENERATED` extra marker.
+ */
+function mydump_read_is_default_expression(string $defaultValue, string $extra): bool
+{
+    if (stripos($extra, 'DEFAULT_GENERATED') !== false) {
+        return true;
+    }
+
+    return preg_match(
+        '/^(CURRENT_TIMESTAMP(?:\(\d+\))?|CURRENT_DATE(?:\(\))?|CURRENT_TIME(?:\(\))?|NOW\(\)|UUID\(\)|\(.+\))$/i',
+        trim($defaultValue)
+    ) === 1;
+}
+
+/**
+ * Remove the literal MySQL `unsigned` keyword from a full column type while
+ * leaving every other modifier intact, because the new TSV format wants that
+ * single concept represented only through the `u.` prefix.
+ */
+function mydump_read_strip_unsigned_keyword(string $columnType): string
+{
+    $stripped = preg_replace('/\s+unsigned\b/i', '', $columnType);
+    if ($stripped === null) {
+        return trim($columnType);
+    }
+
+    return trim(preg_replace('/\s+/', ' ', $stripped) ?? $stripped);
+}
+
+/**
+ * Identify the types whose varying size belongs in the separate TSV `length`
+ * column rather than inside the `type` token, namely the string and binary
+ * families where the user explicitly asked for this split representation.
+ */
+function mydump_read_is_length_driven_type(string $dataType): bool
+{
+    return in_array($dataType, ['char', 'varchar', 'binary', 'varbinary'], true);
+}
+
+/**
+ * Identify types that are already complete as bare names in the TSV `type`
+ * column and therefore do not need to preserve any parenthesized detail from
+ * MySQL's full `COLUMN_TYPE` representation.
+ */
+function mydump_read_is_simple_type_without_length(string $dataType): bool
+{
+    return in_array(
+        $dataType,
+        [
+            'tinyint', 'smallint', 'mediumint', 'int', 'bigint',
+            'date', 'datetime', 'timestamp', 'time', 'year',
+            'json', 'tinytext', 'text', 'mediumtext', 'longtext',
+            'tinyblob', 'blob', 'mediumblob', 'longblob',
+            'geometry', 'point', 'linestring', 'polygon',
+            'multipoint', 'multilinestring', 'multipolygon', 'geometrycollection',
+        ],
+        true
+    );
+}
+
+/**
+ * Identify types that meaningfully support MySQL's `unsigned` modifier so the
+ * read program can decide whether a detected unsigned column should gain the
+ * `u.` prefix or simply leave the type text untouched.
+ */
+function mydump_read_is_unsigned_capable_type(string $dataType): bool
+{
+    return in_array(
+        $dataType,
+        ['tinyint', 'smallint', 'mediumint', 'int', 'bigint', 'decimal', 'numeric', 'float', 'double', 'real'],
+        true
+    );
+}
+
+/**
+ * Identify types whose defaults should be treated as textual literals by
+ * default when dumping, because unquoted human-readable values are friendlier
+ * in TSV and the write program can safely re-quote them later.
+ */
+function mydump_read_is_string_like_type(string $dataType): bool
+{
+    return in_array(
+        $dataType,
+        [
+            'char', 'varchar', 'tinytext', 'text', 'mediumtext', 'longtext',
+            'enum', 'set',
+        ],
+        true
+    );
+}
+
+/**
+ * Identify temporal types so the read program can preserve temporal defaults
+ * in a readable plain-text form, leaving the write program to decide whether a
+ * given value should be quoted or treated as a recognized SQL expression.
+ */
+function mydump_read_is_temporal_type(string $dataType): bool
+{
+    return in_array($dataType, ['date', 'datetime', 'timestamp', 'time', 'year'], true);
+}
+
+/**
+ * Build a field-name lookup of the single-column index features that the TSV
+ * can actually encode, while intentionally ignoring unsupported index shapes
+ * that are instead surfaced through explicit warnings for the owning table.
+ */
+function mydump_read_build_expressible_index_map(PDO $pdo, string $tableName): array
+{
+    $rows = mydump_read_fetch_index_rows($pdo, $tableName);
+    $grouped = [];
+
+    foreach ($rows as $row) {
+        $name = (string) ($row['Key_name'] ?? '');
+        if ($name === '') {
+            continue;
+        }
+
+        if (!isset($grouped[$name])) {
+            $grouped[$name] = [];
+        }
+        $grouped[$name][] = $row;
+    }
+
+    $indexMap = [];
+    foreach ($grouped as $name => $group) {
+        if (count($group) !== 1) {
+            continue;
+        }
+
+        $row = $group[0];
+        $columnName = (string) ($row['Column_name'] ?? '');
+        if ($columnName === '') {
+            continue;
+        }
+
+        $indexType = strtoupper((string) ($row['Index_type'] ?? 'BTREE'));
+        if (!in_array($indexType, ['BTREE', 'HASH'], true)) {
+            continue;
+        }
+        if (($row['Sub_part'] ?? null) !== null) {
+            continue;
+        }
+
+        if (!isset($indexMap[$columnName])) {
+            $indexMap[$columnName] = [
+                'properties' => ['PK' => false, 'UK' => false],
+                'index' => '',
+            ];
+        }
+
+        if ($name === 'PRIMARY') {
+            $indexMap[$columnName]['properties']['PK'] = true;
+            continue;
+        }
+
+        $isUnique = ((int) ($row['Non_unique'] ?? 1)) === 0;
+        if ($isUnique) {
+            $indexMap[$columnName]['properties']['UK'] = true;
+            continue;
+        }
+
+        $indexMap[$columnName]['index'] = ($indexType === 'HASH') ? 'HA' : 'Y';
+    }
+
+    return $indexMap;
+}
+
+/**
+ * Fetch raw index rows using `SHOW INDEX` because it exposes the practical
+ * details we need both for expressing supported single-column indexes and for
+ * warning about every unsupported variant that the TSV would lose.
+ */
+function mydump_read_fetch_index_rows(PDO $pdo, string $tableName): array
+{
+    $sql = 'SHOW INDEX FROM ' . mydump_read_quote_identifier($tableName);
+    return $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
+}
+
+/**
+ * Collect every warning that should accompany one table or view dump, keeping
+ * the read output honest whenever the schema contains information the flat TSV
+ * cannot fully store and therefore cannot reliably round-trip later.
+ */
+function mydump_read_collect_object_warnings(PDO $pdo, string $databaseName, array $object): array
+{
+    $warnings = [];
+    $tableName = (string) ($object['name'] ?? '');
+
+    foreach (mydump_read_collect_view_warnings($object) as $warning) {
+        $warnings[] = $warning;
+    }
+    foreach (mydump_read_collect_engine_warnings($object) as $warning) {
+        $warnings[] = $warning;
+    }
+    foreach (mydump_read_collect_table_comment_warnings($object) as $warning) {
+        $warnings[] = $warning;
+    }
+    foreach (mydump_read_collect_index_warnings($pdo, $tableName, $object) as $warning) {
+        $warnings[] = $warning;
+    }
+    foreach (mydump_read_collect_foreign_key_warnings($pdo, $databaseName, $tableName) as $warning) {
+        $warnings[] = $warning;
+    }
+    foreach (mydump_read_collect_check_warnings($pdo, $databaseName, $tableName) as $warning) {
+        $warnings[] = $warning;
+    }
+    foreach (mydump_read_collect_generated_column_warnings($pdo, $databaseName, $tableName) as $warning) {
+        $warnings[] = $warning;
+    }
+
+    return mydump_read_unique_values($warnings);
+}
+
+/**
+ * Warn whenever the current object is a view, because the TSV can list its
+ * fields but cannot preserve the SELECT definition required to recreate that
+ * view during the write phase.
+ */
+function mydump_read_collect_view_warnings(array $object): array
+{
+    if ((string) ($object['tv'] ?? 'T') !== 'V') {
+        return [];
+    }
+
+    $tableName = (string) ($object['name'] ?? '');
+    return [
+        "Warning [{$tableName}]: view definition cannot be represented in TSV; write mode will not be able to recreate this view.",
+    ];
+}
+
+/**
+ * Warn when a table engine falls outside the compact `IDB` / `MEM` vocabulary,
+ * because the TSV file must either blank that value or normalize it in a way
+ * that cannot guarantee an exact round-trip later.
+ */
+function mydump_read_collect_engine_warnings(array $object): array
+{
+    if ((string) ($object['tv'] ?? 'T') !== 'T') {
+        return [];
+    }
+
+    $engine = strtoupper(trim((string) ($object['engine'] ?? '')));
+    if ($engine === '' || in_array($engine, ['INNODB', 'MEMORY', 'HEAP'], true)) {
+        return [];
+    }
+
+    $tableName = (string) ($object['name'] ?? '');
+    return [
+        "Warning [{$tableName}]: engine '{$engine}' cannot be fully represented in TSV; only IDB and MEM are supported.",
+    ];
+}
+
+/**
+ * Warn when a table comment exists, because the new flat TSV has no dedicated
+ * place to store table-level comments and therefore that metadata would be
+ * silently lost without an explicit warning.
+ */
+function mydump_read_collect_table_comment_warnings(array $object): array
+{
+    if ((string) ($object['tv'] ?? 'T') !== 'T') {
+        return [];
+    }
+
+    $comment = trim((string) ($object['table_comment'] ?? ''));
+    if ($comment === '') {
+        return [];
+    }
+
+    $tableName = (string) ($object['name'] ?? '');
+    return [
+        "Warning [{$tableName}]: table comment is not represented in TSV output.",
+    ];
+}
+
+/**
+ * Warn about every index that does not fit the deliberately tiny TSV index
+ * model: anything multi-column, partial, descending, invisible, commented, or
+ * using an unsupported index family must be called out explicitly.
+ */
+function mydump_read_collect_index_warnings(PDO $pdo, string $tableName, array $object): array
+{
+    if ((string) ($object['tv'] ?? 'T') !== 'T') {
+        return [];
+    }
+
+    $rows = mydump_read_fetch_index_rows($pdo, $tableName);
+    $grouped = [];
+    foreach ($rows as $row) {
+        $name = (string) ($row['Key_name'] ?? '');
+        if ($name === '') {
+            continue;
+        }
+        if (!isset($grouped[$name])) {
+            $grouped[$name] = [];
+        }
+        $grouped[$name][] = $row;
+    }
+
+    $warnings = [];
+    foreach ($grouped as $indexName => $group) {
+        $first = $group[0];
+        $indexType = strtoupper((string) ($first['Index_type'] ?? 'BTREE'));
+        $hasMultipleColumns = count($group) !== 1;
+        $hasPrefix = false;
+        $hasDescending = false;
+        $hasComments = false;
+        $hasUnsupportedType = !in_array($indexType, ['BTREE', 'HASH'], true);
+        $hasUnrepresentableHash = $indexType === 'HASH'
+            && (
+                $indexName === 'PRIMARY'
+                || ((int) ($first['Non_unique'] ?? 1)) === 0
+            );
+
+        foreach ($group as $row) {
+            if (($row['Sub_part'] ?? null) !== null) {
+                $hasPrefix = true;
+            }
+
+            $collation = strtoupper((string) ($row['Collation'] ?? 'A'));
+            if ($collation !== '' && $collation !== 'A') {
+                $hasDescending = true;
+            }
+
+            $comment = trim((string) ($row['Comment'] ?? ''));
+            $indexComment = trim((string) ($row['Index_comment'] ?? ''));
+            if ($comment !== '' || $indexComment !== '') {
+                $hasComments = true;
+            }
+        }
+
+        if (
+            !$hasMultipleColumns
+            && !$hasPrefix
+            && !$hasDescending
+            && !$hasComments
+            && !$hasUnsupportedType
+            && !$hasUnrepresentableHash
+        ) {
+            continue;
+        }
+
+        $reasons = [];
+        if ($hasMultipleColumns) {
+            $reasons[] = 'multi-column';
+        }
+        if ($hasPrefix) {
+            $reasons[] = 'prefix length';
+        }
+        if ($hasDescending) {
+            $reasons[] = 'descending order';
+        }
+        if ($hasComments) {
+            $reasons[] = 'comments';
+        }
+        if ($hasUnsupportedType) {
+            $reasons[] = 'type ' . $indexType;
+        }
+        if ($hasUnrepresentableHash) {
+            $reasons[] = 'HASH algorithm on primary/unique index';
+        }
+
+        $warnings[] = "Warning [{$tableName}]: index '{$indexName}' is not fully representable in TSV (" . implode(', ', $reasons) . ').';
+    }
+
+    return $warnings;
+}
+
+/**
+ * Warn when a table owns foreign keys, because the TSV field list has no place
+ * to preserve the relationship metadata and importing it back would therefore
+ * risk silently losing referential constraints.
+ */
+function mydump_read_collect_foreign_key_warnings(PDO $pdo, string $databaseName, string $tableName): array
+{
+    $statement = $pdo->prepare(
+        'SELECT DISTINCT CONSTRAINT_NAME
+         FROM information_schema.KEY_COLUMN_USAGE
+         WHERE TABLE_SCHEMA = :database
+           AND TABLE_NAME = :table
+           AND REFERENCED_TABLE_NAME IS NOT NULL
+         ORDER BY CONSTRAINT_NAME'
+    );
+    $statement->execute([
+        'database' => $databaseName,
+        'table' => $tableName,
+    ]);
+
+    $warnings = [];
+    foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $constraintName = (string) ($row['CONSTRAINT_NAME'] ?? '');
+        if ($constraintName === '') {
+            continue;
+        }
+
+        $warnings[] = "Warning [{$tableName}]: foreign key '{$constraintName}' is not represented in TSV output.";
+    }
+
+    return $warnings;
+}
+
+/**
+ * Warn when a table contains check constraints, because the flat TSV format is
+ * intentionally column-oriented and does not include any table-level mechanism
+ * for preserving those boolean validation expressions.
+ */
+function mydump_read_collect_check_warnings(PDO $pdo, string $databaseName, string $tableName): array
+{
+    $statement = $pdo->prepare(
+        'SELECT DISTINCT CONSTRAINT_NAME
+         FROM information_schema.TABLE_CONSTRAINTS
+         WHERE TABLE_SCHEMA = :database
+           AND TABLE_NAME = :table
+           AND CONSTRAINT_TYPE = \'CHECK\'
+         ORDER BY CONSTRAINT_NAME'
+    );
+    $statement->execute([
+        'database' => $databaseName,
+        'table' => $tableName,
+    ]);
+
+    $warnings = [];
+    foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $constraintName = (string) ($row['CONSTRAINT_NAME'] ?? '');
+        if ($constraintName === '') {
+            continue;
+        }
+
+        $warnings[] = "Warning [{$tableName}]: check constraint '{$constraintName}' is not represented in TSV output.";
+    }
+
+    return $warnings;
+}
+
+/**
+ * Warn when generated columns exist, because the TSV format only stores plain
+ * column definitions and therefore cannot preserve the generation expression or
+ * whether the column is virtual versus stored.
+ */
+function mydump_read_collect_generated_column_warnings(PDO $pdo, string $databaseName, string $tableName): array
+{
+    $statement = $pdo->prepare(
+        'SELECT COLUMN_NAME
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = :database
+           AND TABLE_NAME = :table
+           AND GENERATION_EXPRESSION IS NOT NULL
+           AND GENERATION_EXPRESSION <> \'\'
+         ORDER BY ORDINAL_POSITION'
+    );
+    $statement->execute([
+        'database' => $databaseName,
+        'table' => $tableName,
+    ]);
+
+    $warnings = [];
+    foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $columnName = (string) ($row['COLUMN_NAME'] ?? '');
+        if ($columnName === '') {
+            continue;
+        }
+
+        $warnings[] = "Warning [{$tableName}]: generated column '{$columnName}' cannot be fully represented in TSV output.";
+    }
+
+    return $warnings;
+}
+
+/**
+ * Write the final flattened data set as a proper TSV file with one header row
+ * and one row per field, relying on PHP's CSV writer with a tab delimiter so
+ * quoting stays correct even when comments contain tabs or line breaks.
+ */
+function mydump_read_write_tsv(string $path, array $rows): void
+{
+    $handle = fopen($path, 'wb');
+    if ($handle === false) {
+        throw new RuntimeException("Unable to open output file: {$path}");
+    }
+
+    try {
+        fputcsv($handle, mydump_read_tsv_headers(), "\t");
+        foreach ($rows as $row) {
+            $ordered = [];
+            foreach (mydump_read_tsv_headers() as $header) {
+                $ordered[] = (string) ($row[$header] ?? '');
+            }
+            fputcsv($handle, $ordered, "\t");
+        }
+    } finally {
+        fclose($handle);
+    }
+}
+
+/**
+ * Return the canonical TSV header order once so every read-side writer call
+ * stays consistent and the write program later knows exactly which columns to
+ * expect when it validates incoming files.
+ */
+function mydump_read_tsv_headers(): array
+{
+    return ['tv', 'table', 'eng', 'name', 'type', 'length', 'properties', 'index', 'collation', 'default', 'comment'];
+}
+
+/**
+ * Deduplicate read-side values locally so the read program can stay internally
+ * self-contained after CLI parsing and still emit stable warning and file-path
+ * lists without repeating the same text multiple times.
+ */
+function mydump_read_unique_values(array $values): array
+{
+    $seen = [];
+    $result = [];
+
+    foreach ($values as $value) {
+        $text = trim((string) $value);
+        if ($text === '') {
+            continue;
+        }
+
+        $key = strtolower($text);
+        if (isset($seen[$key])) {
+            continue;
+        }
+
+        $seen[$key] = true;
+        $result[] = $text;
+    }
+
+    return $result;
+}
+
+/**
+ * Emit deduplicated warnings to standard error after the dump completes, which
+ * keeps the TSV file itself clean while still making every lossy conversion
+ * obvious to the person running the command.
+ */
+function mydump_read_emit_warnings(array $warnings): void
+{
+    foreach (mydump_read_unique_values($warnings) as $warning) {
+        fwrite(STDERR, $warning . PHP_EOL);
+    }
+}
+
+/**
+ * Quote one MySQL identifier for the read program's metadata queries so table
+ * names containing reserved words or special characters remain safe anywhere a
+ * `SHOW INDEX` style statement must interpolate the object name directly.
+ */
+function mydump_read_quote_identifier(string $identifier): string
+{
+    return '`' . str_replace('`', '``', $identifier) . '`';
+}
+
+// ---------------------------------------------------------------------------
+// mydump-write
+// ---------------------------------------------------------------------------
+
+/**
+ * Execute the write half of the tool: load the TSV file, validate and group
+ * its rows, convert them into the limited schema model supported by the format,
+ * and then create or alter tables accordingly while skipping unsupported views.
+ */
+function mydump_run_write_program(array $cli): void
+{
+    $inputPath = mydump_write_resolve_input_path($cli);
+    $objects = mydump_write_read_tsv_schema($inputPath);
+    $connection = mydump_write_resolve_connection($cli['options']);
+    $pdo = mydump_write_connect_server($connection, false);
+
+    $databaseExists = mydump_write_database_exists($pdo, $connection['db']);
+    if (!$databaseExists) {
+        mydump_write_create_database($pdo, $connection['db'], 'utf8mb4', 'utf8mb4_unicode_ci');
+        fwrite(STDOUT, "Created database `{$connection['db']}`" . PHP_EOL);
+    }
+
+    $pdo->exec('USE ' . mydump_write_quote_identifier($connection['db']));
+
+    $plan = mydump_write_build_plan($pdo, $connection['db'], $objects);
+    mydump_write_emit_warnings($plan['warnings']);
+
+    if (empty($plan['statements'])) {
+        fwrite(STDOUT, 'No changes required.' . PHP_EOL);
+        return;
+    }
+
+    if ($databaseExists && ($cli['options']['run'] ?? false) !== true) {
+        $confirmed = mydump_confirm(
+            "Database `{$connection['db']}` already exists. Apply " . count($plan['statements']) . ' statement(s)?',
+            true
+        );
+        if (!$confirmed) {
+            fwrite(STDOUT, 'Aborted by user.' . PHP_EOL);
+            return;
+        }
+    }
+
+    foreach ($plan['statements'] as $statement) {
+        $pdo->exec($statement);
+        fwrite(STDOUT, '[OK] ' . $statement . PHP_EOL);
+    }
+
+    fwrite(STDOUT, 'Write complete.' . PHP_EOL);
+}
+
+/**
+ * Resolve and validate the TSV input path for write mode, honoring the old
+ * `write <file>` and plain positional-file shortcuts while ensuring the new
+ * format restriction to `.tsv` is enforced consistently.
+ */
+function mydump_write_resolve_input_path(array $cli): string
+{
+    $inputPath = trim((string) ($cli['input'] ?? ''));
+    if ($inputPath === '') {
+        $inputPath = mydump_prompt('Input file (.tsv)', null, true);
+    }
+
+    if (!is_file($inputPath)) {
+        throw new RuntimeException("Input file not found: {$inputPath}");
+    }
+
+    if (strtolower((string) pathinfo($inputPath, PATHINFO_EXTENSION)) !== 'tsv') {
+        throw new RuntimeException('Write mode input must end in .tsv');
+    }
+
+    return $inputPath;
+}
+
+/**
+ * Read and validate the TSV file, verify the header shape, and group the flat
+ * rows back into one in-memory object per table or view so later write logic
+ * can reason about schema changes in a structured way again.
+ */
+function mydump_write_read_tsv_schema(string $path): array
+{
+    $handle = fopen($path, 'rb');
+    if ($handle === false) {
+        throw new RuntimeException("Unable to open input file: {$path}");
+    }
+
+    try {
+        $header = fgetcsv($handle, 0, "\t");
+        if (!is_array($header)) {
+            throw new RuntimeException('Input TSV is empty.');
+        }
+
+        $normalizedHeader = [];
+        foreach ($header as $headerCell) {
+            $normalizedHeader[] = mydump_write_normalize_header((string) $headerCell);
+        }
+
+        mydump_write_validate_tsv_header($normalizedHeader);
+
+        $objectsByName = [];
+        $lineNumber = 1;
+        while (($row = fgetcsv($handle, 0, "\t")) !== false) {
+            $lineNumber++;
+            $assoc = mydump_write_combine_row($normalizedHeader, $row);
+            if (mydump_write_row_is_empty($assoc)) {
+                continue;
+            }
+
+            $field = mydump_write_parse_row($assoc, $lineNumber);
+            $tableName = $field['table'];
+
+            if (!isset($objectsByName[$tableName])) {
+                $objectsByName[$tableName] = [
+                    'name' => $tableName,
+                    'tv' => $field['tv'],
+                    'eng' => $field['eng'],
+                    'fields' => [],
+                ];
+            }
+
+            mydump_write_assert_consistent_table_metadata($objectsByName[$tableName], $field, $lineNumber);
+            $field['position'] = count($objectsByName[$tableName]['fields']) + 1;
+            $objectsByName[$tableName]['fields'][] = $field;
+        }
+
+        return array_values($objectsByName);
+    } finally {
+        fclose($handle);
+    }
+}
+
+/**
+ * Normalize a TSV header cell into a safe key format so the write parser can
+ * accept exact headers while still tolerating minor cosmetic differences like
+ * spaces or case changes if the file was edited by hand.
+ */
+function mydump_write_normalize_header(string $value): string
+{
+    $normalized = strtolower(trim($value));
+    $normalized = str_replace([' ', '-', '.'], '_', $normalized);
+    return preg_replace('/[^a-z0-9_]/', '', $normalized) ?? '';
+}
+
+/**
+ * Validate that the incoming TSV header contains exactly the columns required
+ * by the new format, because write mode depends on each named field to rebuild
+ * types, indexes, defaults, and comments without any hidden extra structure.
+ */
+function mydump_write_validate_tsv_header(array $header): void
+{
+        $expected = mydump_write_tsv_headers();
+    if ($header !== $expected) {
+        throw new RuntimeException(
+            'Invalid TSV header. Expected: ' . implode("\t", $expected)
+        );
+    }
+}
+
+/**
+ * Combine one raw TSV row with the normalized header into an associative array
+ * so every later parsing step can refer to named columns instead of positional
+ * indexes and produce clearer validation messages when data is malformed.
+ */
+function mydump_write_combine_row(array $header, array $row): array
+{
+    $assoc = [];
+    foreach ($header as $index => $key) {
+        $assoc[$key] = (string) ($row[$index] ?? '');
+    }
+
+    return $assoc;
+}
+
+/**
+ * Detect whether a parsed associative TSV row is completely blank, allowing
+ * the write parser to safely skip visual separators or accidental empty lines
+ * without treating them as broken schema entries.
+ */
+function mydump_write_row_is_empty(array $row): bool
+{
+    foreach ($row as $value) {
+        if (trim((string) $value) !== '') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Parse and validate one TSV row into the internal field structure used by the
+ * write program, normalizing compact markers like `tv`, `eng`, `properties`,
+ * and `index` into strongly interpreted values early on.
+ */
+function mydump_write_parse_row(array $row, int $lineNumber): array
+{
+    $tableName = trim((string) ($row['table'] ?? ''));
+    $fieldName = trim((string) ($row['name'] ?? ''));
+    $typeToken = trim((string) ($row['type'] ?? ''));
+
+    if ($tableName === '') {
+        throw new RuntimeException("Line {$lineNumber}: table is required.");
+    }
+    if ($fieldName === '') {
+        throw new RuntimeException("Line {$lineNumber}: name is required.");
+    }
+    if ($typeToken === '') {
+        throw new RuntimeException("Line {$lineNumber}: type is required.");
+    }
+
+    return [
+        'tv' => mydump_write_normalize_tv((string) ($row['tv'] ?? ''), $lineNumber),
+        'table' => $tableName,
+        'eng' => mydump_write_normalize_engine_code((string) ($row['eng'] ?? ''), $lineNumber),
+        'name' => $fieldName,
+        'type' => $typeToken,
+        'length' => trim((string) ($row['length'] ?? '')),
+        'properties' => mydump_write_normalize_properties((string) ($row['properties'] ?? ''), $lineNumber),
+        'index' => mydump_write_normalize_index_marker((string) ($row['index'] ?? ''), $lineNumber),
+        'collation' => trim((string) ($row['collation'] ?? '')),
+        'default' => (string) ($row['default'] ?? ''),
+        'comment' => (string) ($row['comment'] ?? ''),
+    ];
+}
+
+/**
+ * Normalize the `tv` cell to a strict `T` or `V`, rejecting anything else so
+ * the write plan never has to guess whether a given group of rows describes a
+ * table or a view.
+ */
+function mydump_write_normalize_tv(string $value, int $lineNumber): string
+{
+    $normalized = strtoupper(trim($value));
+    if (!in_array($normalized, ['T', 'V'], true)) {
+        throw new RuntimeException("Line {$lineNumber}: tv must be T or V.");
+    }
+
+    return $normalized;
+}
+
+/**
+ * Normalize the compact engine code and reject unknown values early, because
+ * the new format intentionally narrows table engines to the explicit two-code
+ * vocabulary that the user requested.
+ */
+function mydump_write_normalize_engine_code(string $value, int $lineNumber): string
+{
+    $normalized = strtoupper(trim($value));
+    if ($normalized === '') {
+        return '';
+    }
+
+    if (!in_array($normalized, ['IDB', 'MEM'], true)) {
+        throw new RuntimeException("Line {$lineNumber}: eng must be IDB, MEM, or blank.");
+    }
+
+    return $normalized;
+}
+
+/**
+ * Normalize the aggregated `properties` cell into a boolean map for PK, NN,
+ * UK, and AI, rejecting unknown property tokens so schema intent stays precise
+ * and manual edits fail loudly instead of being half-ignored.
+ */
+function mydump_write_normalize_properties(string $value, int $lineNumber): array
+{
+    $properties = ['PK' => false, 'NN' => false, 'UK' => false, 'AI' => false];
+    $trimmed = trim($value);
+    if ($trimmed === '') {
+        return $properties;
+    }
+
+    foreach (array_map('trim', explode(',', $trimmed)) as $part) {
+        if ($part === '') {
+            continue;
+        }
+
+        $token = strtoupper($part);
+        if (!array_key_exists($token, $properties)) {
+            throw new RuntimeException("Line {$lineNumber}: unknown property '{$part}'.");
+        }
+
+        $properties[$token] = true;
+    }
+
+    return $properties;
+}
+
+/**
+ * Normalize the TSV index marker into the tiny set of supported values, since
+ * the write program only knows how to create blank, BTREE-style, or HASH-style
+ * single-column ordinary indexes.
+ */
+function mydump_write_normalize_index_marker(string $value, int $lineNumber): string
+{
+    $normalized = strtoupper(trim($value));
+    if ($normalized === '') {
+        return '';
+    }
+
+    if (!in_array($normalized, ['Y', 'HA'], true)) {
+        throw new RuntimeException("Line {$lineNumber}: index must be Y, HA, or blank.");
+    }
+
+    return $normalized;
+}
+
+/**
+ * Ensure all rows belonging to the same table name repeat the same table-level
+ * metadata (`tv` and `eng`), because the new file format encodes those values
+ * redundantly on every field row and inconsistent edits would be ambiguous.
+ */
+function mydump_write_assert_consistent_table_metadata(array $object, array $field, int $lineNumber): void
+{
+    if ((string) $object['tv'] !== (string) $field['tv']) {
+        throw new RuntimeException("Line {$lineNumber}: tv must be consistent for every row of table '{$field['table']}'.");
+    }
+
+    if ((string) $object['eng'] !== (string) $field['eng']) {
+        throw new RuntimeException("Line {$lineNumber}: eng must be consistent for every row of table '{$field['table']}'.");
+    }
+}
+
+/**
+ * Resolve the write-side MySQL connection strictly from explicit shell args,
+ * because the tool is now intentionally literal single-file only and no longer
+ * reads local PHP config files or connection constants from elsewhere.
+ */
+function mydump_write_resolve_connection(array $options): array
+{
+    $host = mydump_write_require_shell_connection_value('-host', $options['host'] ?? null);
+    $portText = mydump_write_require_shell_connection_value('-port', $options['port'] ?? null);
+    $user = mydump_write_require_shell_connection_value('-user', $options['user'] ?? null);
+    $database = mydump_write_require_shell_connection_value('-db', $options['db'] ?? null);
+
+    $password = $options['pass'] ?? null;
+    $passwordProvided = (bool) ($options['pass_provided'] ?? false);
+    if (!$passwordProvided) {
+        throw new RuntimeException('Missing required shell argument: -pass');
+    }
+
+    if (!ctype_digit($portText) || (int) $portText < 1 || (int) $portText > 65535) {
+        throw new RuntimeException('Shell argument -port must be an integer between 1 and 65535.');
+    }
+
+    return [
+        'host' => $host,
+        'port' => (int) $portText,
+        'user' => $user,
+        'pass' => (string) ($password ?? ''),
+        'db' => $database,
+    ];
+}
+
+/**
+ * Require one non-empty shell-supplied connection value for the write program
+ * and fail fast with a precise flag name when a mandatory argument is missing.
+ */
+function mydump_write_require_shell_connection_value(string $flagName, ?string $value): string
+{
+    $text = trim((string) $value);
+    if ($text === '') {
+        throw new RuntimeException("Missing required shell argument: {$flagName}");
+    }
+
+    return $text;
+}
+
+/**
+ * Create a PDO connection for the write program with the same error mode and
+ * charset choices as the read half so DDL generation and metadata inspection
+ * can both rely on uniform database behavior.
+ */
+function mydump_write_connect_server(array $connection, bool $withDatabase): PDO
+{
+    $dsn = 'mysql:host=' . $connection['host'] . ';port=' . $connection['port'] . ';charset=utf8mb4';
+    if ($withDatabase) {
+        $dsn .= ';dbname=' . $connection['db'];
+    }
+
+    return new PDO(
+        $dsn,
+        $connection['user'],
+        $connection['pass'],
+        [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        ]
+    );
+}
+
+/**
+ * Check whether the target database already exists before the write program
+ * decides whether to create it, mirroring the old tool's behavior of creating
+ * missing databases automatically during import.
+ */
+function mydump_write_database_exists(PDO $pdo, string $databaseName): bool
+{
+    $statement = $pdo->prepare(
+        'SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = :database LIMIT 1'
+    );
+    $statement->execute(['database' => $databaseName]);
+
+    return (bool) $statement->fetchColumn();
+}
+
+/**
+ * Create the destination database with a conservative UTF-8 default when the
+ * TSV import targets a schema that does not yet exist, since the new TSV file
+ * intentionally no longer carries database-level charset metadata.
+ */
+function mydump_write_create_database(PDO $pdo, string $databaseName, string $charset, string $collation): void
+{
+    if (preg_match('/^[A-Za-z0-9_]+$/', $charset) !== 1) {
         $charset = 'utf8mb4';
     }
-    if (!preg_match('/^[A-Za-z0-9_]+$/', $collation)) {
+    if (preg_match('/^[A-Za-z0-9_]+$/', $collation) !== 1) {
         $collation = 'utf8mb4_unicode_ci';
     }
 
-    $sql = 'CREATE DATABASE ' . mydump_quote_identifier($dbName)
+    $sql = 'CREATE DATABASE ' . mydump_write_quote_identifier($databaseName)
         . ' CHARACTER SET ' . $charset
         . ' COLLATE ' . $collation;
 
     $pdo->exec($sql);
 }
 
-function mydump_fetch_schema(PDO $pdo, string $dbName): array
+/**
+ * Build the full write plan by comparing desired TSV objects to the current
+ * database contents, generating create or alter statements for tables, and
+ * collecting explicit warnings for views and other limitations the format
+ * cannot safely apply during import.
+ */
+function mydump_write_build_plan(PDO $pdo, string $databaseName, array $objects): array
 {
-    $schemaStmt = $pdo->prepare(
-        'SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME
-         FROM information_schema.SCHEMATA
-         WHERE SCHEMA_NAME = :db'
-    );
-    $schemaStmt->execute(['db' => $dbName]);
-    $schemaRow = $schemaStmt->fetch(PDO::FETCH_ASSOC) ?: [];
+    $existingObjectMap = mydump_write_fetch_existing_object_map($pdo, $databaseName);
+    $statements = [];
+    $warnings = [];
 
-    $tablesStmt = $pdo->prepare(
-        'SELECT TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_COLLATION
-         FROM information_schema.TABLES
-         WHERE TABLE_SCHEMA = :db
-         ORDER BY TABLE_NAME'
-    );
-    $tablesStmt->execute(['db' => $dbName]);
-    $tableRows = $tablesStmt->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($objects as $object) {
+        $tableName = (string) ($object['name'] ?? '');
+        if ($tableName === '') {
+            continue;
+        }
 
-    $objects = [];
-    foreach ($tableRows as $tableRow) {
-        $tableName = (string) $tableRow['TABLE_NAME'];
-        $tableType = strtoupper((string) $tableRow['TABLE_TYPE']);
-        $isView = ($tableType === 'VIEW');
+        if ((string) ($object['tv'] ?? 'T') === 'V') {
+            $warnings[] = "Warning [{$tableName}]: write mode skips views because TSV does not store a recreatable view definition.";
+            continue;
+        }
 
-        $fields = mydump_fetch_columns($pdo, $dbName, $tableName);
-        $indexes = $isView ? [] : mydump_fetch_indexes($pdo, $tableName);
-        $createSql = mydump_fetch_create_sql($pdo, $tableName, $isView);
+        $existingType = $existingObjectMap[$tableName] ?? null;
+        if ($existingType === null) {
+            $statements[] = mydump_write_build_create_table_sql($object);
+            continue;
+        }
 
-        $objects[] = [
-            'name' => $tableName,
-            'type' => $isView ? 'view' : 'table',
-            'engine' => $isView ? null : (string) ($tableRow['ENGINE'] ?? ''),
-            'collation' => (string) ($tableRow['TABLE_COLLATION'] ?? ''),
-            'create_sql' => $createSql,
-            'fields' => $fields,
-            'indexes' => $indexes,
-        ];
+        if ($existingType === 'VIEW') {
+            $statements[] = 'DROP VIEW ' . mydump_write_quote_identifier($tableName);
+            $statements[] = mydump_write_build_create_table_sql($object);
+            continue;
+        }
+
+        $alterSql = mydump_write_build_alter_table_sql($pdo, $databaseName, $object);
+        if ($alterSql !== null) {
+            $statements[] = $alterSql;
+        }
     }
 
     return [
-        'database' => [
-            'name' => (string) ($schemaRow['SCHEMA_NAME'] ?? $dbName),
-            'default_character_set' => (string) ($schemaRow['DEFAULT_CHARACTER_SET_NAME'] ?? 'utf8mb4'),
-            'default_collation' => (string) ($schemaRow['DEFAULT_COLLATION_NAME'] ?? 'utf8mb4_unicode_ci'),
-        ],
-        'objects' => $objects,
-        'generated_at' => date('c'),
+        'statements' => $statements,
+        'warnings' => mydump_write_unique_values($warnings),
     ];
 }
 
-function mydump_fetch_columns(PDO $pdo, string $dbName, string $tableName): array
+/**
+ * Fetch the current object map of the target database so write mode can choose
+ * between `CREATE TABLE`, `DROP VIEW + CREATE TABLE`, or `ALTER TABLE` without
+ * having to perform extra existence checks inside every branch.
+ */
+function mydump_write_fetch_existing_object_map(PDO $pdo, string $databaseName): array
 {
-    $sql = 'SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_KEY, COLLATION_NAME, COLUMN_COMMENT, ORDINAL_POSITION, GENERATION_EXPRESSION
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = :db AND TABLE_NAME = :table
-            ORDER BY ORDINAL_POSITION';
-    $stmt = $pdo->prepare($sql);
-    $stmt->execute(['db' => $dbName, 'table' => $tableName]);
+    $statement = $pdo->prepare(
+        'SELECT TABLE_NAME, TABLE_TYPE
+         FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = :database'
+    );
+    $statement->execute(['database' => $databaseName]);
+
+    $map = [];
+    foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $map[(string) ($row['TABLE_NAME'] ?? '')] = strtoupper((string) ($row['TABLE_TYPE'] ?? ''));
+    }
+
+    return $map;
+}
+
+/**
+ * Generate a complete `CREATE TABLE` statement from the TSV model by ordering
+ * fields as they appeared in the file, rendering each column definition, and
+ * then appending the expressible single-column primary, unique, and normal
+ * indexes that the flat format can represent.
+ */
+function mydump_write_build_create_table_sql(array $object): string
+{
+    $tableName = (string) ($object['name'] ?? '');
+    $fields = (array) ($object['fields'] ?? []);
+    if (empty($fields)) {
+        throw new RuntimeException("Table '{$tableName}' has no fields.");
+    }
+
+    $lines = [];
+    foreach ($fields as $field) {
+        $lines[] = '  ' . mydump_write_render_column_definition($field);
+    }
+
+    foreach (mydump_write_build_desired_index_specs($fields) as $indexSpec) {
+        $lines[] = '  ' . mydump_write_render_index_definition($indexSpec, false);
+    }
+
+    $sql = 'CREATE TABLE ' . mydump_write_quote_identifier($tableName)
+        . " (\n" . implode(",\n", $lines) . "\n)";
+
+    $engineSql = mydump_write_render_engine_clause((string) ($object['eng'] ?? ''));
+    if ($engineSql !== '') {
+        $sql .= ' ' . $engineSql;
+    }
+
+    return $sql;
+}
+
+/**
+ * Generate an `ALTER TABLE` statement by diffing the current database schema
+ * against the desired TSV model, handling column order, column definitions,
+ * and the subset of index operations the flat format can safely express.
+ */
+function mydump_write_build_alter_table_sql(PDO $pdo, string $databaseName, array $object): ?string
+{
+    $tableName = (string) ($object['name'] ?? '');
+    $desiredFields = (array) ($object['fields'] ?? []);
+    if (empty($desiredFields)) {
+        return null;
+    }
+
+    $currentFields = mydump_write_fetch_current_fields($pdo, $databaseName, $tableName);
+    $currentIndexes = mydump_write_fetch_current_expressible_indexes($pdo, $tableName);
+    $currentEngine = mydump_write_fetch_current_engine_code($pdo, $databaseName, $tableName);
+
+    $currentFieldsByName = [];
+    $currentFieldOrder = [];
+    foreach ($currentFields as $position => $field) {
+        $name = (string) $field['name'];
+        $currentFieldsByName[$name] = $field;
+        $currentFieldOrder[$name] = $position + 1;
+    }
+
+    $desiredFieldsByName = [];
+    $columnOperations = [];
+    $previousFieldName = null;
+
+    foreach ($desiredFields as $position => $field) {
+        $fieldName = (string) ($field['name'] ?? '');
+        if ($fieldName === '') {
+            continue;
+        }
+
+        $desiredFieldsByName[$fieldName] = $field;
+        $positionSql = ($previousFieldName === null)
+            ? ' FIRST'
+            : (' AFTER ' . mydump_write_quote_identifier($previousFieldName));
+
+        if (!isset($currentFieldsByName[$fieldName])) {
+            $columnOperations[] = 'ADD COLUMN ' . mydump_write_render_column_definition($field) . $positionSql;
+            $previousFieldName = $fieldName;
+            continue;
+        }
+
+        $currentField = $currentFieldsByName[$fieldName];
+        $sameDefinition = mydump_write_field_signature($currentField) === mydump_write_field_signature($field);
+        $samePosition = ($currentFieldOrder[$fieldName] ?? 0) === ($position + 1);
+
+        if (!$sameDefinition || !$samePosition) {
+            $columnOperations[] = 'MODIFY COLUMN ' . mydump_write_render_column_definition($field) . $positionSql;
+        }
+
+        $previousFieldName = $fieldName;
+    }
+
+    foreach ($currentFieldsByName as $fieldName => $field) {
+        if (!isset($desiredFieldsByName[$fieldName])) {
+            $columnOperations[] = 'DROP COLUMN ' . mydump_write_quote_identifier($fieldName);
+        }
+    }
+
+    $indexOperations = mydump_write_build_index_diff(
+        $currentIndexes,
+        mydump_write_build_desired_index_specs($desiredFields)
+    );
+
+    $engineOperation = mydump_write_build_engine_alter_clause($currentEngine, (string) ($object['eng'] ?? ''));
+
+    $operations = array_merge($indexOperations['drop'], $columnOperations, $indexOperations['add']);
+    if ($engineOperation !== null) {
+        $operations[] = $engineOperation;
+    }
+
+    if (empty($operations)) {
+        return null;
+    }
+
+    return 'ALTER TABLE ' . mydump_write_quote_identifier($tableName) . ' ' . implode(', ', $operations);
+}
+
+/**
+ * Fetch the current table fields and convert them into the same internal field
+ * model used for TSV rows so definition comparison can be done deterministically
+ * without trying to diff raw SQL fragments.
+ */
+function mydump_write_fetch_current_fields(PDO $pdo, string $databaseName, string $tableName): array
+{
+    $statement = $pdo->prepare(
+        'SELECT
+            COLUMN_NAME,
+            DATA_TYPE,
+            COLUMN_TYPE,
+            CHARACTER_MAXIMUM_LENGTH,
+            IS_NULLABLE,
+            COLUMN_DEFAULT,
+            EXTRA,
+            COLLATION_NAME,
+            COLUMN_COMMENT,
+            ORDINAL_POSITION
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = :database
+           AND TABLE_NAME = :table
+         ORDER BY ORDINAL_POSITION'
+    );
+    $statement->execute([
+        'database' => $databaseName,
+        'table' => $tableName,
+    ]);
+
+    $rows = $statement->fetchAll(PDO::FETCH_ASSOC);
+    $indexMap = mydump_write_build_current_index_map($pdo, $tableName);
 
     $fields = [];
-    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-        $defaultMeta = mydump_detect_default_meta(
-            $row['COLUMN_DEFAULT'],
-            strtoupper((string) $row['IS_NULLABLE']) === 'YES',
-            (string) ($row['EXTRA'] ?? '')
-        );
+    foreach ($rows as $row) {
+        $fieldName = (string) ($row['COLUMN_NAME'] ?? '');
+        $indexMeta = $indexMap[$fieldName] ?? ['properties' => ['PK' => false, 'UK' => false], 'index' => ''];
 
         $fields[] = [
-            'name' => (string) $row['COLUMN_NAME'],
-            'type' => (string) $row['COLUMN_TYPE'],
-            'nullable' => strtoupper((string) $row['IS_NULLABLE']) === 'YES',
-            'default_kind' => $defaultMeta['kind'],
-            'default_value' => $defaultMeta['value'],
-            'extra' => (string) ($row['EXTRA'] ?? ''),
-            'key' => (string) ($row['COLUMN_KEY'] ?? ''),
+            'name' => $fieldName,
+            'type' => mydump_write_encode_current_type_token($row),
+            'length' => mydump_write_encode_current_length($row),
+            'properties' => mydump_write_encode_current_properties($row, $indexMeta),
+            'index' => (string) ($indexMeta['index'] ?? ''),
             'collation' => (string) ($row['COLLATION_NAME'] ?? ''),
+            'default' => mydump_write_encode_current_default($row),
             'comment' => (string) ($row['COLUMN_COMMENT'] ?? ''),
-            'position' => (int) ($row['ORDINAL_POSITION'] ?? 0),
-            'generation_expression' => (string) ($row['GENERATION_EXPRESSION'] ?? ''),
         ];
     }
 
     return $fields;
 }
 
-function mydump_detect_default_meta($columnDefault, bool $nullable, string $extra): array
+/**
+ * Convert the current column's type into the same token grammar the TSV uses,
+ * which keeps current-versus-desired comparisons aligned with what users see
+ * and edit in the flat file itself.
+ */
+function mydump_write_encode_current_type_token(array $column): string
 {
-    if ($columnDefault === null) {
-        return [
-            'kind' => $nullable ? 'null' : 'none',
-            'value' => '',
-        ];
+    $dataType = strtolower(trim((string) ($column['DATA_TYPE'] ?? '')));
+    $columnType = trim((string) ($column['COLUMN_TYPE'] ?? ''));
+    $isUnsigned = preg_match('/\bunsigned\b/i', $columnType) === 1;
+    $typeCore = mydump_write_strip_unsigned_keyword($columnType);
+
+    if (mydump_write_is_length_driven_type($dataType)) {
+        $typeCore = $dataType;
+    } elseif ($dataType !== '' && mydump_write_is_simple_type_without_length($dataType)) {
+        $typeCore = $dataType;
+    } elseif ($typeCore === '') {
+        $typeCore = $dataType;
     }
 
-    $value = (string) $columnDefault;
-    if (mydump_is_expression_default($value, $extra)) {
-        return ['kind' => 'expression', 'value' => $value];
+    if ($isUnsigned && mydump_write_is_unsigned_capable_type($dataType)) {
+        return 'u.' . $typeCore;
     }
 
-    return ['kind' => 'literal', 'value' => $value];
+    return $typeCore;
 }
 
-function mydump_is_expression_default(string $value, string $extra): bool
+/**
+ * Convert the current column length into the same dedicated TSV length cell so
+ * the write-side comparison logic stays faithful to the user-facing flat file
+ * instead of inventing a separate internal representation.
+ */
+function mydump_write_encode_current_length(array $column): string
 {
-    if (stripos($extra, 'DEFAULT_GENERATED') !== false) {
-        return true;
-    }
-
-    return preg_match('/^(CURRENT_TIMESTAMP(?:\(\d+\))?|NOW\(\)|UUID\(\)|NULL|\(.+\))$/i', trim($value)) === 1;
-}
-
-function mydump_fetch_indexes(PDO $pdo, string $tableName): array
-{
-    $sql = 'SHOW INDEX FROM ' . mydump_quote_identifier($tableName);
-    $rows = $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
-
-    $grouped = [];
-    foreach ($rows as $row) {
-        $name = (string) $row['Key_name'];
-        if (!isset($grouped[$name])) {
-            $grouped[$name] = [
-                'name' => $name,
-                'unique' => ((int) $row['Non_unique']) === 0,
-                'type' => strtoupper((string) ($row['Index_type'] ?? 'BTREE')),
-                'columns' => [],
-            ];
-        }
-
-        $seq = (int) ($row['Seq_in_index'] ?? 0);
-        $grouped[$name]['columns'][$seq] = [
-            'name' => (string) ($row['Column_name'] ?? ''),
-            'length' => $row['Sub_part'] !== null ? (int) $row['Sub_part'] : null,
-        ];
-    }
-
-    foreach ($grouped as &$index) {
-        ksort($index['columns']);
-        $index['columns'] = array_values($index['columns']);
-    }
-    unset($index);
-
-    uasort($grouped, static function (array $a, array $b): int {
-        if ($a['name'] === 'PRIMARY') {
-            return -1;
-        }
-        if ($b['name'] === 'PRIMARY') {
-            return 1;
-        }
-        return strcmp($a['name'], $b['name']);
-    });
-
-    return array_values($grouped);
-}
-
-function mydump_fetch_create_sql(PDO $pdo, string $name, bool $isView): string
-{
-    $sql = $isView
-        ? ('SHOW CREATE VIEW ' . mydump_quote_identifier($name))
-        : ('SHOW CREATE TABLE ' . mydump_quote_identifier($name));
-
-    $row = $pdo->query($sql)->fetch(PDO::FETCH_ASSOC);
-    if (!$row) {
+    $dataType = strtolower(trim((string) ($column['DATA_TYPE'] ?? '')));
+    if (!mydump_write_is_length_driven_type($dataType)) {
         return '';
     }
 
-    foreach ($row as $key => $value) {
-        if (stripos((string) $key, 'Create ') === 0) {
-            return trim((string) $value);
-        }
+    $length = $column['CHARACTER_MAXIMUM_LENGTH'] ?? null;
+    if ($length === null || $length === '') {
+        return '';
+    }
+
+    return (string) (int) $length;
+}
+
+/**
+ * Convert current column and index metadata back into the aggregated property
+ * map used by the TSV so comparison can focus on semantic equality rather than
+ * the specific SQL clauses used to produce those semantics.
+ */
+function mydump_write_encode_current_properties(array $column, array $indexMeta): array
+{
+    return [
+        'PK' => (bool) ($indexMeta['properties']['PK'] ?? false),
+        'NN' => strtoupper((string) ($column['IS_NULLABLE'] ?? 'YES')) !== 'YES',
+        'UK' => (bool) ($indexMeta['properties']['UK'] ?? false),
+        'AI' => str_contains(strtolower((string) ($column['EXTRA'] ?? '')), 'auto_increment'),
+    ];
+}
+
+/**
+ * Convert current default metadata into the same flat default cell syntax the
+ * TSV uses, which allows the write-side diff to compare user-edited values and
+ * live database values using one common representation.
+ */
+function mydump_write_encode_current_default(array $column): string
+{
+    $defaultValue = $column['COLUMN_DEFAULT'] ?? null;
+    $dataType = strtolower(trim((string) ($column['DATA_TYPE'] ?? '')));
+    $isNullable = strtoupper((string) ($column['IS_NULLABLE'] ?? 'YES')) === 'YES';
+    $extra = (string) ($column['EXTRA'] ?? '');
+
+    if ($defaultValue === null) {
+        return $isNullable ? 'NULL' : '';
+    }
+
+    $defaultText = (string) $defaultValue;
+    if (mydump_write_is_default_expression($defaultText, $extra)) {
+        return $defaultText;
+    }
+
+    if ($defaultText === '') {
+        return "''";
+    }
+
+    return $defaultText;
+}
+
+/**
+ * Fetch the current engine and convert it into the same compact code expected
+ * by the TSV so engine changes can be diffed without exposing raw MySQL engine
+ * names everywhere in the rest of the write logic.
+ */
+function mydump_write_fetch_current_engine_code(PDO $pdo, string $databaseName, string $tableName): string
+{
+    $statement = $pdo->prepare(
+        'SELECT ENGINE
+         FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = :database
+           AND TABLE_NAME = :table'
+    );
+    $statement->execute([
+        'database' => $databaseName,
+        'table' => $tableName,
+    ]);
+
+    $row = $statement->fetch(PDO::FETCH_ASSOC) ?: [];
+    $engine = strtoupper(trim((string) ($row['ENGINE'] ?? '')));
+    if ($engine === 'INNODB') {
+        return 'IDB';
+    }
+    if ($engine === 'MEMORY' || $engine === 'HEAP') {
+        return 'MEM';
     }
 
     return '';
 }
 
-function mydump_write_schema_file(array $schema, string $path, string $format): void
+/**
+ * Fetch the current expressible single-column indexes in a normalized form so
+ * write mode can compare index intent semantically and avoid unnecessary churn
+ * when the existing database uses different physical index names.
+ */
+function mydump_write_fetch_current_expressible_indexes(PDO $pdo, string $tableName): array
 {
-    $dir = dirname($path);
-    if (!is_dir($dir)) {
-        throw new RuntimeException("Directory does not exist: {$dir}");
-    }
-
-    if ($format === 'json') {
-        $json = json_encode($schema, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if ($json === false) {
-            throw new RuntimeException('Unable to encode JSON output.');
-        }
-        file_put_contents($path, $json . PHP_EOL);
-        return;
-    }
-
-    $worksheets = mydump_schema_to_worksheets($schema);
-    mydump_xlsx_write($path, $worksheets);
-}
-
-function mydump_schema_to_worksheets(array $schema): array
-{
-    $headers = [
-        'kind',
-        'table_name',
-        'field_name',
-        'position',
-        'column_type',
-        'nullable',
-        'default_kind',
-        'default_value',
-        'extra',
-        'key',
-        'collation',
-        'comment',
-        'generation_expression',
-        'indexes_json',
-        'table_engine',
-        'table_collation',
-        'create_sql',
-    ];
-
-    $worksheets = [];
-    foreach (($schema['objects'] ?? []) as $object) {
-        $name = (string) ($object['name'] ?? 'Sheet');
-        $type = strtolower((string) ($object['type'] ?? 'table'));
-        $fields = $object['fields'] ?? [];
-
-        if (!is_array($fields) || empty($fields)) {
-            $fields = [[
-                'name' => '',
-                'position' => 1,
-                'type' => '',
-                'nullable' => true,
-                'default_kind' => 'none',
-                'default_value' => '',
-                'extra' => '',
-                'key' => '',
-                'collation' => '',
-                'comment' => '',
-                'generation_expression' => '',
-            ]];
-        }
-
-        $rows = [$headers];
-        $first = true;
-        foreach ($fields as $field) {
-            $rows[] = [
-                $type,
-                $name,
-                (string) ($field['name'] ?? ''),
-                (string) ($field['position'] ?? ''),
-                (string) ($field['type'] ?? ''),
-                !empty($field['nullable']) ? 'YES' : 'NO',
-                (string) ($field['default_kind'] ?? 'none'),
-                (string) ($field['default_value'] ?? ''),
-                (string) ($field['extra'] ?? ''),
-                (string) ($field['key'] ?? ''),
-                (string) ($field['collation'] ?? ''),
-                (string) ($field['comment'] ?? ''),
-                (string) ($field['generation_expression'] ?? ''),
-                $first ? json_encode($object['indexes'] ?? [], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : '',
-                $first ? (string) ($object['engine'] ?? '') : '',
-                $first ? (string) ($object['collation'] ?? '') : '',
-                $first ? (string) ($object['create_sql'] ?? '') : '',
-            ];
-            $first = false;
-        }
-
-        $worksheets[$name] = $rows;
-    }
-
-    if (empty($worksheets)) {
-        $worksheets['schema'] = [$headers];
-    }
-
-    return $worksheets;
-}
-
-function mydump_read_schema_file(string $path, string $format): array
-{
-    if ($format === 'json') {
-        $decoded = json_decode((string) file_get_contents($path), true);
-        if (!is_array($decoded)) {
-            throw new RuntimeException('Invalid JSON input file.');
-        }
-        return mydump_normalize_schema($decoded);
-    }
-
-    $worksheets = mydump_xlsx_read($path);
-    return mydump_normalize_schema(mydump_schema_from_worksheets($worksheets));
-}
-
-function mydump_schema_from_worksheets(array $worksheets): array
-{
-    $objects = [];
-
-    foreach ($worksheets as $sheetName => $rows) {
-        if (!is_array($rows) || count($rows) === 0) {
-            continue;
-        }
-
-        $header = array_map('mydump_normalize_header', (array) $rows[0]);
-        if (empty($header)) {
-            continue;
-        }
-
-        $object = [
-            'name' => (string) $sheetName,
-            'type' => 'table',
-            'engine' => '',
-            'collation' => '',
-            'create_sql' => '',
-            'fields' => [],
-            'indexes' => [],
-        ];
-
-        for ($i = 1, $n = count($rows); $i < $n; $i++) {
-            $row = (array) $rows[$i];
-            $assoc = [];
-            foreach ($header as $idx => $key) {
-                if ($key === '') {
-                    continue;
-                }
-                $assoc[$key] = (string) ($row[$idx] ?? '');
-            }
-
-            if (mydump_row_is_empty($assoc)) {
-                continue;
-            }
-
-            if (!empty($assoc['table_name'])) {
-                $object['name'] = $assoc['table_name'];
-            }
-            if (!empty($assoc['kind'])) {
-                $kind = strtolower($assoc['kind']);
-                $object['type'] = ($kind === 'view') ? 'view' : 'table';
-            }
-            if ($object['engine'] === '' && !empty($assoc['table_engine'])) {
-                $object['engine'] = $assoc['table_engine'];
-            }
-            if ($object['collation'] === '' && !empty($assoc['table_collation'])) {
-                $object['collation'] = $assoc['table_collation'];
-            }
-            if ($object['create_sql'] === '' && !empty($assoc['create_sql'])) {
-                $object['create_sql'] = $assoc['create_sql'];
-            }
-
-            if (empty($object['indexes']) && !empty($assoc['indexes_json'])) {
-                $parsed = json_decode($assoc['indexes_json'], true);
-                if (is_array($parsed)) {
-                    $object['indexes'] = $parsed;
-                }
-            }
-
-            $fieldName = (string) ($assoc['field_name'] ?? ($assoc['column_name'] ?? ''));
-            if ($fieldName === '') {
-                continue;
-            }
-
-            $nullable = mydump_parse_yes_no($assoc['nullable'] ?? 'YES', true);
-            $defaultKind = strtolower(trim((string) ($assoc['default_kind'] ?? '')));
-            $defaultValue = (string) ($assoc['default_value'] ?? ($assoc['default'] ?? ''));
-            if ($defaultKind === '') {
-                if ($defaultValue !== '') {
-                    $defaultKind = 'literal';
-                } else {
-                    $defaultKind = $nullable ? 'null' : 'none';
-                }
-            }
-
-            $object['fields'][] = [
-                'name' => $fieldName,
-                'position' => (int) ($assoc['position'] ?? ($i + 1)),
-                'type' => (string) ($assoc['column_type'] ?? ($assoc['type'] ?? 'varchar(255)')),
-                'nullable' => $nullable,
-                'default_kind' => $defaultKind,
-                'default_value' => $defaultValue,
-                'extra' => (string) ($assoc['extra'] ?? ''),
-                'key' => (string) ($assoc['key'] ?? ''),
-                'collation' => (string) ($assoc['collation'] ?? ''),
-                'comment' => (string) ($assoc['comment'] ?? ''),
-                'generation_expression' => (string) ($assoc['generation_expression'] ?? ''),
-            ];
-        }
-
-        if (!empty($object['fields']) || $object['create_sql'] !== '') {
-            $objects[] = $object;
-        }
-    }
-
-    return ['objects' => $objects];
-}
-
-function mydump_normalize_schema(array $schema): array
-{
-    $database = [
-        'name' => mydump_extract_database_name($schema),
-        'default_character_set' => mydump_extract_database_charset($schema),
-        'default_collation' => mydump_extract_database_collation($schema),
-    ];
-
-    $objectsRaw = [];
-    if (isset($schema['objects']) && is_array($schema['objects'])) {
-        $objectsRaw = $schema['objects'];
-    } elseif (isset($schema['tables']) && is_array($schema['tables'])) {
-        $objectsRaw = $schema['tables'];
-        if (isset($schema['views']) && is_array($schema['views'])) {
-            foreach ($schema['views'] as $view) {
-                if (is_array($view)) {
-                    $view['type'] = 'view';
-                    $objectsRaw[] = $view;
-                }
-            }
-        }
-    }
-
-    if (mydump_is_assoc($objectsRaw)) {
-        $named = [];
-        foreach ($objectsRaw as $name => $objectRaw) {
-            if (is_array($objectRaw)) {
-                if (!isset($objectRaw['name'])) {
-                    $objectRaw['name'] = (string) $name;
-                }
-                $named[] = $objectRaw;
-            }
-        }
-        $objectsRaw = $named;
-    }
-
-    $objects = [];
-    foreach ($objectsRaw as $objectRaw) {
-        if (!is_array($objectRaw)) {
-            continue;
-        }
-        $object = mydump_normalize_object($objectRaw);
-        if ($object !== null) {
-            $objects[] = $object;
-        }
-    }
-
-    return [
-        'database' => $database,
-        'objects' => $objects,
-    ];
-}
-
-function mydump_normalize_object(array $objectRaw): ?array
-{
-    $name = (string) ($objectRaw['name'] ?? ($objectRaw['table_name'] ?? ''));
-    if ($name === '') {
-        return null;
-    }
-
-    $typeRaw = strtolower((string) ($objectRaw['type'] ?? $objectRaw['kind'] ?? 'table'));
-    $type = ($typeRaw === 'view') ? 'view' : 'table';
-
-    $fieldsRaw = $objectRaw['fields'] ?? ($objectRaw['columns'] ?? []);
-    if (mydump_is_assoc($fieldsRaw)) {
-        $tmp = [];
-        foreach ($fieldsRaw as $fieldName => $fieldRaw) {
-            if (is_array($fieldRaw) && !isset($fieldRaw['name'])) {
-                $fieldRaw['name'] = (string) $fieldName;
-            }
-            $tmp[] = $fieldRaw;
-        }
-        $fieldsRaw = $tmp;
-    }
-
-    $fields = [];
-    if (is_array($fieldsRaw)) {
-        foreach ($fieldsRaw as $fieldRaw) {
-            if (!is_array($fieldRaw)) {
-                continue;
-            }
-            $field = mydump_normalize_field($fieldRaw);
-            if ($field !== null) {
-                $fields[] = $field;
-            }
-        }
-    }
-
-    usort($fields, static function (array $a, array $b): int {
-        return ($a['position'] <=> $b['position']) ?: strcmp($a['name'], $b['name']);
-    });
-
-    $indexesRaw = $objectRaw['indexes'] ?? [];
-    if (is_string($indexesRaw)) {
-        $decoded = json_decode($indexesRaw, true);
-        if (is_array($decoded)) {
-            $indexesRaw = $decoded;
-        } else {
-            $indexesRaw = [];
-        }
-    }
-    $indexes = mydump_normalize_indexes($indexesRaw);
-
-    return [
-        'name' => $name,
-        'type' => $type,
-        'engine' => (string) ($objectRaw['engine'] ?? ($objectRaw['table_engine'] ?? '')),
-        'collation' => (string) ($objectRaw['collation'] ?? ($objectRaw['table_collation'] ?? '')),
-        'create_sql' => (string) ($objectRaw['create_sql'] ?? ($objectRaw['sql'] ?? '')),
-        'fields' => $fields,
-        'indexes' => $indexes,
-    ];
-}
-
-function mydump_normalize_field(array $fieldRaw): ?array
-{
-    $name = (string) ($fieldRaw['name'] ?? ($fieldRaw['field'] ?? ($fieldRaw['column_name'] ?? '')));
-    if ($name === '') {
-        return null;
-    }
-
-    $nullable = $fieldRaw['nullable'] ?? ($fieldRaw['null'] ?? true);
-    if (is_string($nullable)) {
-        $nullable = mydump_parse_yes_no($nullable, true);
-    } else {
-        $nullable = (bool) $nullable;
-    }
-
-    $defaultKind = strtolower(trim((string) ($fieldRaw['default_kind'] ?? '')));
-    $defaultValue = (string) ($fieldRaw['default_value'] ?? ($fieldRaw['default'] ?? ''));
-    if ($defaultKind === '') {
-        if ($defaultValue !== '') {
-            $defaultKind = 'literal';
-        } else {
-            $defaultKind = $nullable ? 'null' : 'none';
-        }
-    }
-
-    return [
-        'name' => $name,
-        'position' => (int) ($fieldRaw['position'] ?? ($fieldRaw['ordinal_position'] ?? 0)),
-        'type' => (string) ($fieldRaw['type'] ?? ($fieldRaw['column_type'] ?? 'varchar(255)')),
-        'nullable' => $nullable,
-        'default_kind' => $defaultKind,
-        'default_value' => $defaultValue,
-        'extra' => (string) ($fieldRaw['extra'] ?? ''),
-        'key' => (string) ($fieldRaw['key'] ?? ''),
-        'collation' => (string) ($fieldRaw['collation'] ?? ''),
-        'comment' => (string) ($fieldRaw['comment'] ?? ''),
-        'generation_expression' => (string) ($fieldRaw['generation_expression'] ?? ''),
-    ];
-}
-
-function mydump_normalize_indexes($indexesRaw): array
-{
-    if (!is_array($indexesRaw)) {
-        return [];
-    }
-
-    $indexes = [];
-    foreach ($indexesRaw as $indexRaw) {
-        if (!is_array($indexRaw)) {
-            continue;
-        }
-
-        $name = (string) ($indexRaw['name'] ?? '');
+    $rows = mydump_write_fetch_index_rows($pdo, $tableName);
+    $grouped = [];
+    foreach ($rows as $row) {
+        $name = (string) ($row['Key_name'] ?? '');
         if ($name === '') {
             continue;
         }
-
-        $colsRaw = $indexRaw['columns'] ?? [];
-        $columns = [];
-        if (is_array($colsRaw)) {
-            foreach ($colsRaw as $colRaw) {
-                if (is_string($colRaw)) {
-                    $columns[] = ['name' => $colRaw, 'length' => null];
-                } elseif (is_array($colRaw)) {
-                    $colName = (string) ($colRaw['name'] ?? '');
-                    if ($colName === '') {
-                        continue;
-                    }
-                    $length = $colRaw['length'] ?? ($colRaw['sub_part'] ?? null);
-                    $columns[] = [
-                        'name' => $colName,
-                        'length' => $length !== null && $length !== '' ? (int) $length : null,
-                    ];
-                }
-            }
+        if (!isset($grouped[$name])) {
+            $grouped[$name] = [];
         }
+        $grouped[$name][] = $row;
+    }
 
-        if (empty($columns)) {
+    $indexes = [];
+    foreach ($grouped as $name => $group) {
+        if (count($group) !== 1) {
             continue;
         }
 
+        $row = $group[0];
+        $columnName = (string) ($row['Column_name'] ?? '');
+        if ($columnName === '') {
+            continue;
+        }
+
+        $indexType = strtoupper((string) ($row['Index_type'] ?? 'BTREE'));
+        if (!in_array($indexType, ['BTREE', 'HASH'], true)) {
+            continue;
+        }
+        if (($row['Sub_part'] ?? null) !== null) {
+            continue;
+        }
+
+        $kind = 'IDX';
+        if ($name === 'PRIMARY') {
+            $kind = 'PK';
+        } elseif (((int) ($row['Non_unique'] ?? 1)) === 0) {
+            $kind = 'UK';
+        }
+
         $indexes[] = [
-            'name' => $name,
-            'unique' => (bool) ($indexRaw['unique'] ?? false),
-            'type' => strtoupper((string) ($indexRaw['type'] ?? 'BTREE')),
-            'columns' => $columns,
+            'actual_name' => $name,
+            'kind' => $kind,
+            'column' => $columnName,
+            'algorithm' => ($kind === 'IDX' && $indexType === 'HASH') ? 'HA' : (($indexType === 'HASH') ? 'HA' : 'Y'),
         ];
     }
-
-    usort($indexes, static function (array $a, array $b): int {
-        if ($a['name'] === 'PRIMARY') {
-            return -1;
-        }
-        if ($b['name'] === 'PRIMARY') {
-            return 1;
-        }
-        return strcmp($a['name'], $b['name']);
-    });
 
     return $indexes;
 }
 
-function mydump_schema_database_name(array $schema): ?string
+/**
+ * Build a field-name lookup of the current table's expressible single-column
+ * indexes so the write-side field normalization can reconstruct current PK, UK,
+ * and ordinary-index markers using the same compact model as the TSV.
+ */
+function mydump_write_build_current_index_map(PDO $pdo, string $tableName): array
 {
-    $name = (string) (($schema['database']['name'] ?? '') ?: '');
-    return $name !== '' ? $name : null;
-}
-
-function mydump_extract_database_name(array $schema): string
-{
-    if (isset($schema['database']) && is_array($schema['database'])) {
-        $candidate = (string) ($schema['database']['name'] ?? ($schema['database']['db'] ?? ''));
-        if ($candidate !== '') {
-            return $candidate;
-        }
-    }
-
-    $candidate = (string) ($schema['db'] ?? ($schema['database_name'] ?? ''));
-    return $candidate;
-}
-
-function mydump_extract_database_charset(array $schema): string
-{
-    if (isset($schema['database']) && is_array($schema['database'])) {
-        $candidate = (string) ($schema['database']['default_character_set'] ?? ($schema['database']['charset'] ?? ''));
-        if ($candidate !== '') {
-            return $candidate;
-        }
-    }
-
-    return 'utf8mb4';
-}
-
-function mydump_extract_database_collation(array $schema): string
-{
-    if (isset($schema['database']) && is_array($schema['database'])) {
-        $candidate = (string) ($schema['database']['default_collation'] ?? ($schema['database']['collation'] ?? ''));
-        if ($candidate !== '') {
-            return $candidate;
-        }
-    }
-
-    return 'utf8mb4_unicode_ci';
-}
-
-function mydump_build_write_plan(PDO $pdo, string $dbName, array $schema): array
-{
-    $existingMap = mydump_fetch_existing_object_map($pdo, $dbName);
-    $statements = [];
-
-    foreach (($schema['objects'] ?? []) as $object) {
-        if (!is_array($object)) {
-            continue;
-        }
-
-        $name = (string) ($object['name'] ?? '');
-        if ($name === '') {
-            continue;
-        }
-
-        $desiredType = strtolower((string) ($object['type'] ?? 'table'));
-        $existsType = $existingMap[$name] ?? null;
-
-        if ($desiredType === 'view') {
-            $viewSql = mydump_prepare_view_create_sql((string) ($object['create_sql'] ?? ''), $name);
-            if ($viewSql === '') {
-                throw new RuntimeException("View '{$name}' is missing create_sql in input.");
-            }
-
-            if ($existsType === 'BASE TABLE') {
-                $statements[] = ['sql' => 'DROP TABLE ' . mydump_quote_identifier($name)];
-            }
-
-            $statements[] = ['sql' => $viewSql];
-            continue;
-        }
-
-        if ($existsType === null) {
-            $createSql = mydump_build_create_table_sql($object);
-            $statements[] = ['sql' => $createSql];
-            continue;
-        }
-
-        if ($existsType === 'VIEW') {
-            $statements[] = ['sql' => 'DROP VIEW ' . mydump_quote_identifier($name)];
-            $statements[] = ['sql' => mydump_build_create_table_sql($object)];
-            continue;
-        }
-
-        $alterSql = mydump_build_alter_table_sql($pdo, $dbName, $object);
-        if ($alterSql !== null) {
-            $statements[] = ['sql' => $alterSql];
-        }
-    }
-
-    return ['statements' => $statements];
-}
-
-function mydump_fetch_existing_object_map(PDO $pdo, string $dbName): array
-{
-    $stmt = $pdo->prepare(
-        'SELECT TABLE_NAME, TABLE_TYPE
-         FROM information_schema.TABLES
-         WHERE TABLE_SCHEMA = :db'
-    );
-    $stmt->execute(['db' => $dbName]);
-
+    $indexes = mydump_write_fetch_current_expressible_indexes($pdo, $tableName);
     $map = [];
-    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-        $map[(string) $row['TABLE_NAME']] = strtoupper((string) $row['TABLE_TYPE']);
+
+    foreach ($indexes as $index) {
+        $columnName = (string) ($index['column'] ?? '');
+        if ($columnName === '') {
+            continue;
+        }
+
+        if (!isset($map[$columnName])) {
+            $map[$columnName] = [
+                'properties' => ['PK' => false, 'UK' => false],
+                'index' => '',
+            ];
+        }
+
+        if ((string) $index['kind'] === 'PK') {
+            $map[$columnName]['properties']['PK'] = true;
+            continue;
+        }
+
+        if ((string) $index['kind'] === 'UK') {
+            $map[$columnName]['properties']['UK'] = true;
+            continue;
+        }
+
+        $map[$columnName]['index'] = (string) ($index['algorithm'] ?? 'Y');
     }
+
     return $map;
 }
 
-function mydump_build_create_table_sql(array $object): string
+/**
+ * Fetch raw `SHOW INDEX` rows for the write program, which needs the actual
+ * index names in order to drop obsolete indexes even though comparison itself
+ * is done using normalized semantic signatures.
+ */
+function mydump_write_fetch_index_rows(PDO $pdo, string $tableName): array
 {
-    $createSql = trim((string) ($object['create_sql'] ?? ''));
-    if ($createSql !== '') {
-        return rtrim($createSql, ';');
-    }
-
-    $name = (string) ($object['name'] ?? '');
-    $fields = $object['fields'] ?? [];
-    if (!is_array($fields) || empty($fields)) {
-        throw new RuntimeException("Table '{$name}' has no fields and no create_sql.");
-    }
-
-    usort($fields, static function (array $a, array $b): int {
-        return ($a['position'] <=> $b['position']) ?: strcmp($a['name'], $b['name']);
-    });
-
-    $lines = [];
-    foreach ($fields as $field) {
-        $lines[] = '  ' . mydump_column_definition_sql($field);
-    }
-
-    $indexes = mydump_normalize_indexes($object['indexes'] ?? []);
-    foreach ($indexes as $index) {
-        $indexDef = mydump_index_definition_sql($index, false);
-        if ($indexDef !== '') {
-            $lines[] = '  ' . $indexDef;
-        }
-    }
-
-    $sql = 'CREATE TABLE ' . mydump_quote_identifier($name) . " (\n" . implode(",\n", $lines) . "\n)";
-
-    $engine = (string) ($object['engine'] ?? '');
-    if ($engine !== '' && preg_match('/^[A-Za-z0-9_]+$/', $engine) === 1) {
-        $sql .= ' ENGINE=' . $engine;
-    }
-
-    $collation = (string) ($object['collation'] ?? '');
-    if ($collation !== '' && preg_match('/^[A-Za-z0-9_]+$/', $collation) === 1) {
-        $sql .= ' COLLATE=' . $collation;
-    }
-
-    return $sql;
+    $sql = 'SHOW INDEX FROM ' . mydump_write_quote_identifier($tableName);
+    return $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
 }
 
-function mydump_build_alter_table_sql(PDO $pdo, string $dbName, array $object): ?string
+/**
+ * Build the desired expressible index list directly from the TSV field model,
+ * turning PK, UK, and ordinary index markers into normalized single-column
+ * index specs with deterministic generated names for new indexes.
+ */
+function mydump_write_build_desired_index_specs(array $fields): array
 {
-    $tableName = (string) ($object['name'] ?? '');
-    $desiredFields = $object['fields'] ?? [];
-    if (!is_array($desiredFields) || empty($desiredFields)) {
-        return null;
-    }
+    $indexes = [];
 
-    $currentFields = mydump_fetch_columns($pdo, $dbName, $tableName);
-    $currentIndexes = mydump_fetch_indexes($pdo, $tableName);
-
-    $tableMetaStmt = $pdo->prepare(
-        'SELECT ENGINE, TABLE_COLLATION
-         FROM information_schema.TABLES
-         WHERE TABLE_SCHEMA = :db AND TABLE_NAME = :table'
-    );
-    $tableMetaStmt->execute(['db' => $dbName, 'table' => $tableName]);
-    $tableMeta = $tableMetaStmt->fetch(PDO::FETCH_ASSOC) ?: ['ENGINE' => '', 'TABLE_COLLATION' => ''];
-
-    usort($desiredFields, static function (array $a, array $b): int {
-        return ($a['position'] <=> $b['position']) ?: strcmp($a['name'], $b['name']);
-    });
-
-    $currentByName = [];
-    $currentOrder = [];
-    foreach ($currentFields as $idx => $field) {
-        $name = (string) $field['name'];
-        $currentByName[$name] = $field;
-        $currentOrder[$name] = $idx + 1;
-    }
-
-    $desiredByName = [];
-    $columnOps = [];
-    $prevFieldName = null;
-    foreach ($desiredFields as $idx => $field) {
-        $fieldName = (string) $field['name'];
+    foreach ($fields as $field) {
+        $fieldName = (string) ($field['name'] ?? '');
         if ($fieldName === '') {
             continue;
         }
 
-        $desiredByName[$fieldName] = $field;
-        $positionSql = ($prevFieldName === null)
-            ? ' FIRST'
-            : (' AFTER ' . mydump_quote_identifier($prevFieldName));
-
-        if (!isset($currentByName[$fieldName])) {
-            $columnOps[] = 'ADD COLUMN ' . mydump_column_definition_sql($field) . $positionSql;
-            $prevFieldName = $fieldName;
-            continue;
+        $properties = (array) ($field['properties'] ?? []);
+        if (($properties['PK'] ?? false) === true) {
+            $indexes[] = [
+                'actual_name' => 'PRIMARY',
+                'kind' => 'PK',
+                'column' => $fieldName,
+                'algorithm' => 'Y',
+            ];
         }
 
-        $currentField = $currentByName[$fieldName];
-        $sameDef = mydump_column_sign($currentField) === mydump_column_sign($field);
-        $samePos = ($currentOrder[$fieldName] ?? 0) === ($idx + 1);
-
-        if (!$sameDef || !$samePos) {
-            $columnOps[] = 'MODIFY COLUMN ' . mydump_column_definition_sql($field) . $positionSql;
+        if (($properties['UK'] ?? false) === true) {
+            $indexes[] = [
+                'actual_name' => 'uk_' . $fieldName,
+                'kind' => 'UK',
+                'column' => $fieldName,
+                'algorithm' => 'Y',
+            ];
         }
 
-        $prevFieldName = $fieldName;
-    }
-
-    foreach ($currentByName as $fieldName => $field) {
-        if (!isset($desiredByName[$fieldName])) {
-            $columnOps[] = 'DROP COLUMN ' . mydump_quote_identifier($fieldName);
+        $indexMarker = (string) ($field['index'] ?? '');
+        if ($indexMarker !== '') {
+            $indexes[] = [
+                'actual_name' => 'idx_' . $fieldName,
+                'kind' => 'IDX',
+                'column' => $fieldName,
+                'algorithm' => $indexMarker,
+            ];
         }
     }
 
-    $indexOps = mydump_build_index_ops(
-        mydump_normalize_indexes($currentIndexes),
-        mydump_normalize_indexes($object['indexes'] ?? [])
-    );
-
-    $optionOps = [];
-    $desiredEngine = (string) ($object['engine'] ?? '');
-    $currentEngine = (string) ($tableMeta['ENGINE'] ?? '');
-    if (
-        $desiredEngine !== ''
-        && preg_match('/^[A-Za-z0-9_]+$/', $desiredEngine) === 1
-        && strcasecmp($desiredEngine, $currentEngine) !== 0
-    ) {
-        $optionOps[] = 'ENGINE=' . $desiredEngine;
-    }
-
-    $desiredCollation = (string) ($object['collation'] ?? '');
-    $currentCollation = (string) ($tableMeta['TABLE_COLLATION'] ?? '');
-    if (
-        $desiredCollation !== ''
-        && preg_match('/^[A-Za-z0-9_]+$/', $desiredCollation) === 1
-        && strcasecmp($desiredCollation, $currentCollation) !== 0
-    ) {
-        $optionOps[] = 'COLLATE=' . $desiredCollation;
-    }
-
-    $ops = array_merge($indexOps['drop'], $columnOps, $indexOps['add'], $optionOps);
-    if (empty($ops)) {
-        return null;
-    }
-
-    return 'ALTER TABLE ' . mydump_quote_identifier($tableName) . ' ' . implode(', ', $ops);
+    return $indexes;
 }
 
-function mydump_build_index_ops(array $currentIndexes, array $desiredIndexes): array
+/**
+ * Compare current and desired expressible indexes semantically so redundant
+ * renames are avoided, then produce the exact drop and add clauses needed for
+ * the final `ALTER TABLE` statement.
+ */
+function mydump_write_build_index_diff(array $currentIndexes, array $desiredIndexes): array
 {
-    $currentMap = [];
-    foreach ($currentIndexes as $idx) {
-        $currentMap[$idx['name']] = $idx;
-    }
-
-    $desiredMap = [];
-    foreach ($desiredIndexes as $idx) {
-        $desiredMap[$idx['name']] = $idx;
-    }
-
-    $dropOps = [];
-    $addOps = [];
-
-    foreach ($currentMap as $name => $current) {
-        if (!isset($desiredMap[$name])) {
-            $dropOps[] = mydump_drop_index_sql($name);
+    $currentBySignature = [];
+    foreach ($currentIndexes as $index) {
+        $signature = mydump_write_index_signature($index);
+        if (!isset($currentBySignature[$signature])) {
+            $currentBySignature[$signature] = $index;
         }
     }
 
-    foreach ($desiredMap as $name => $desired) {
-        if (!isset($currentMap[$name])) {
-            $add = mydump_index_definition_sql($desired, true);
-            if ($add !== '') {
-                $addOps[] = $add;
-            }
-            continue;
-        }
-
-        if (mydump_index_sign($currentMap[$name]) !== mydump_index_sign($desired)) {
-            $dropOps[] = mydump_drop_index_sql($name);
-            $add = mydump_index_definition_sql($desired, true);
-            if ($add !== '') {
-                $addOps[] = $add;
-            }
+    $desiredBySignature = [];
+    foreach ($desiredIndexes as $index) {
+        $signature = mydump_write_index_signature($index);
+        if (!isset($desiredBySignature[$signature])) {
+            $desiredBySignature[$signature] = $index;
         }
     }
 
-    return ['drop' => $dropOps, 'add' => $addOps];
+    $dropOperations = [];
+    foreach ($currentBySignature as $signature => $index) {
+        if (!isset($desiredBySignature[$signature])) {
+            $dropOperations[] = mydump_write_render_index_drop($index);
+        }
+    }
+
+    $addOperations = [];
+    foreach ($desiredBySignature as $signature => $index) {
+        if (!isset($currentBySignature[$signature])) {
+            $addOperations[] = mydump_write_render_index_definition($index, true);
+        }
+    }
+
+    return [
+        'drop' => $dropOperations,
+        'add' => $addOperations,
+    ];
 }
 
-function mydump_drop_index_sql(string $indexName): string
+/**
+ * Render the SQL needed to drop one current expressible index, taking special
+ * care of MySQL's dedicated `DROP PRIMARY KEY` syntax for primary indexes.
+ */
+function mydump_write_render_index_drop(array $index): string
 {
-    if ($indexName === 'PRIMARY') {
+    if ((string) ($index['kind'] ?? '') === 'PK') {
         return 'DROP PRIMARY KEY';
     }
-    return 'DROP INDEX ' . mydump_quote_identifier($indexName);
+
+    return 'DROP INDEX ' . mydump_write_quote_identifier((string) ($index['actual_name'] ?? ''));
 }
 
-function mydump_index_definition_sql(array $index, bool $withAddKeyword): string
+/**
+ * Render one expressible index definition either for `CREATE TABLE` or `ALTER
+ * TABLE ADD`, using deterministic names for generated indexes and optionally
+ * attaching `USING HASH` when the TSV asks for the HASH variant.
+ */
+function mydump_write_render_index_definition(array $index, bool $withAddKeyword): string
 {
-    $name = (string) ($index['name'] ?? '');
-    $columns = $index['columns'] ?? [];
-    if ($name === '' || !is_array($columns) || empty($columns)) {
-        return '';
+    $prefix = $withAddKeyword ? 'ADD ' : '';
+    $columnSql = '(' . mydump_write_quote_identifier((string) ($index['column'] ?? '')) . ')';
+    $algorithmSql = ((string) ($index['algorithm'] ?? 'Y') === 'HA') ? ' USING HASH' : '';
+
+    if ((string) ($index['kind'] ?? '') === 'PK') {
+        return $prefix . 'PRIMARY KEY ' . $columnSql . $algorithmSql;
     }
 
-    $parts = [];
-    foreach ($columns as $col) {
-        $colName = (string) ($col['name'] ?? '');
-        if ($colName === '') {
-            continue;
-        }
-        $part = mydump_quote_identifier($colName);
-        $length = $col['length'] ?? null;
-        if ($length !== null && $length !== '') {
-            $part .= '(' . (int) $length . ')';
-        }
-        $parts[] = $part;
+    if ((string) ($index['kind'] ?? '') === 'UK') {
+        return $prefix
+            . 'UNIQUE KEY '
+            . mydump_write_quote_identifier((string) ($index['actual_name'] ?? ''))
+            . ' ' . $columnSql . $algorithmSql;
     }
 
-    if (empty($parts)) {
-        return '';
-    }
-
-    $columnsSql = '(' . implode(', ', $parts) . ')';
-    $type = strtoupper((string) ($index['type'] ?? 'BTREE'));
-    $isUnique = (bool) ($index['unique'] ?? false);
-
-    if ($name === 'PRIMARY') {
-        return ($withAddKeyword ? 'ADD ' : '') . 'PRIMARY KEY ' . $columnsSql;
-    }
-
-    if ($type === 'FULLTEXT') {
-        return ($withAddKeyword ? 'ADD ' : '')
-            . 'FULLTEXT KEY ' . mydump_quote_identifier($name) . ' ' . $columnsSql;
-    }
-
-    if ($type === 'SPATIAL') {
-        return ($withAddKeyword ? 'ADD ' : '')
-            . 'SPATIAL KEY ' . mydump_quote_identifier($name) . ' ' . $columnsSql;
-    }
-
-    if ($isUnique) {
-        return ($withAddKeyword ? 'ADD ' : '')
-            . 'UNIQUE KEY ' . mydump_quote_identifier($name) . ' ' . $columnsSql;
-    }
-
-    return ($withAddKeyword ? 'ADD ' : '')
-        . 'KEY ' . mydump_quote_identifier($name) . ' ' . $columnsSql;
+    return $prefix
+        . 'KEY '
+        . mydump_write_quote_identifier((string) ($index['actual_name'] ?? ''))
+        . ' ' . $columnSql . $algorithmSql;
 }
 
-function mydump_index_sign(array $index): string
+/**
+ * Build a stable semantic signature for one expressible index so comparison can
+ * ignore physical index names and focus on what the TSV format actually means:
+ * kind, column, and whether the ordinary index asks for HASH semantics.
+ */
+function mydump_write_index_signature(array $index): string
 {
-    $columns = [];
-    foreach (($index['columns'] ?? []) as $col) {
-        $columns[] = strtolower((string) ($col['name'] ?? '')) . ':' . ((string) ($col['length'] ?? ''));
-    }
+    $kind = (string) ($index['kind'] ?? '');
+    $algorithm = ($kind === 'IDX') ? strtoupper((string) ($index['algorithm'] ?? 'Y')) : '';
 
     return implode('|', [
-        strtoupper((string) ($index['name'] ?? '')),
-        !empty($index['unique']) ? '1' : '0',
-        strtoupper((string) ($index['type'] ?? 'BTREE')),
-        implode(',', $columns),
+        $kind,
+        strtolower((string) ($index['column'] ?? '')),
+        $algorithm,
     ]);
 }
 
-function mydump_column_definition_sql(array $field): string
+/**
+ * Render one column definition from the internal TSV field model, assembling
+ * type, collation, nullability, default, auto-increment, and comment into the
+ * exact SQL fragment needed by both create and alter operations.
+ */
+function mydump_write_render_column_definition(array $field): string
 {
     $name = (string) ($field['name'] ?? '');
-    $type = trim((string) ($field['type'] ?? 'varchar(255)'));
-    if ($name === '' || $type === '') {
-        throw new RuntimeException('Invalid field definition while generating SQL.');
+    if ($name === '') {
+        throw new RuntimeException('Invalid field definition: missing name.');
     }
 
-    $sql = mydump_quote_identifier($name) . ' ' . $type;
-
-    $generationExpr = trim((string) ($field['generation_expression'] ?? ''));
-    $extra = trim((string) ($field['extra'] ?? ''));
-    if ($generationExpr !== '') {
-        $sql .= ' AS (' . $generationExpr . ')';
-        if (stripos($extra, 'STORED') !== false) {
-            $sql .= ' STORED';
-        } else {
-            $sql .= ' VIRTUAL';
-        }
-
-        $comment = (string) ($field['comment'] ?? '');
-        if ($comment !== '') {
-            $sql .= ' COMMENT ' . mydump_quote_string($comment);
-        }
-
-        return $sql;
-    }
+    $sql = mydump_write_quote_identifier($name) . ' ' . mydump_write_render_sql_type($field);
 
     $collation = trim((string) ($field['collation'] ?? ''));
     if ($collation !== '' && preg_match('/^[A-Za-z0-9_]+$/', $collation) === 1) {
         $sql .= ' COLLATE ' . $collation;
     }
 
-    $nullable = !empty($field['nullable']);
-    $sql .= $nullable ? ' NULL' : ' NOT NULL';
+    $properties = (array) ($field['properties'] ?? []);
+    $isNotNull = ($properties['NN'] ?? false) === true
+        || ($properties['AI'] ?? false) === true
+        || ($properties['PK'] ?? false) === true;
+    $sql .= $isNotNull ? ' NOT NULL' : ' NULL';
 
-    $defaultKind = strtolower((string) ($field['default_kind'] ?? 'none'));
-    $defaultValue = (string) ($field['default_value'] ?? '');
-    if ($defaultKind === 'null') {
-        $sql .= ' DEFAULT NULL';
-    } elseif ($defaultKind === 'literal') {
-        $sql .= ' DEFAULT ' . mydump_quote_string($defaultValue);
-    } elseif ($defaultKind === 'expression') {
-        $sql .= ' DEFAULT ' . $defaultValue;
+    $defaultClause = mydump_write_render_default_clause($field);
+    if ($defaultClause !== '') {
+        $sql .= ' ' . $defaultClause;
     }
 
-    $cleanExtra = trim((string) preg_replace('/\bDEFAULT_GENERATED\b/i', '', $extra));
-    if ($cleanExtra !== '') {
-        $sql .= ' ' . $cleanExtra;
+    if (($properties['AI'] ?? false) === true) {
+        $sql .= ' AUTO_INCREMENT';
     }
 
     $comment = (string) ($field['comment'] ?? '');
     if ($comment !== '') {
-        $sql .= ' COMMENT ' . mydump_quote_string($comment);
+        $sql .= ' COMMENT ' . mydump_write_quote_string($comment);
     }
 
     return $sql;
 }
 
-function mydump_column_sign(array $field): string
+/**
+ * Render the SQL data type from the TSV `type` and `length` columns by putting
+ * size back where needed, restoring the MySQL `unsigned` keyword from the `u.`
+ * prefix, and otherwise leaving advanced type expressions untouched.
+ */
+function mydump_write_render_sql_type(array $field): string
 {
-    return implode('|', [
-        strtolower(trim((string) ($field['name'] ?? ''))),
-        strtolower(trim((string) ($field['type'] ?? ''))),
-        !empty($field['nullable']) ? '1' : '0',
-        strtolower((string) ($field['default_kind'] ?? 'none')),
-        (string) ($field['default_value'] ?? ''),
-        strtolower(trim((string) preg_replace('/\bDEFAULT_GENERATED\b/i', '', (string) ($field['extra'] ?? '')))),
-        strtolower((string) ($field['collation'] ?? '')),
-        (string) ($field['comment'] ?? ''),
-        (string) ($field['generation_expression'] ?? ''),
-    ]);
+    $typeToken = trim((string) ($field['type'] ?? ''));
+    $length = trim((string) ($field['length'] ?? ''));
+    if ($typeToken === '') {
+        throw new RuntimeException('Invalid field definition: missing type.');
+    }
+
+    $isUnsigned = str_starts_with(strtolower($typeToken), 'u.');
+    $typeCore = $isUnsigned ? substr($typeToken, 2) : $typeToken;
+    $baseType = strtolower(trim((string) preg_replace('/\(.*/', '', $typeCore)));
+
+    if (mydump_write_is_length_driven_type($baseType)) {
+        if ($length === '' || !ctype_digit($length) || (int) $length < 1) {
+            throw new RuntimeException("Field '{$field['name']}' requires a positive integer length.");
+        }
+        $typeCore = $baseType . '(' . (int) $length . ')';
+    }
+
+    if ($isUnsigned && mydump_write_is_unsigned_capable_type($baseType)) {
+        $typeCore .= ' unsigned';
+    }
+
+    return $typeCore;
 }
 
-function mydump_prepare_view_create_sql(string $createSql, string $viewName): string
+/**
+ * Render the SQL default clause from the flat TSV `default` cell, using light
+ * type-aware heuristics so human-edited values remain convenient while still
+ * preserving raw SQL expressions and already-quoted literals exactly.
+ */
+function mydump_write_render_default_clause(array $field): string
 {
-    $sql = trim($createSql);
-    if ($sql === '') {
+    $defaultValue = (string) ($field['default'] ?? '');
+    if ($defaultValue === '') {
         return '';
     }
 
-    $sql = rtrim($sql, ';');
-    $sql = preg_replace('/\s+DEFINER=`[^`]+`@`[^`]+`/i', '', $sql) ?? $sql;
-
-    if (preg_match('/^CREATE\s+OR\s+REPLACE\s+/i', $sql) !== 1) {
-        $sql = preg_replace('/^CREATE\s+/i', 'CREATE OR REPLACE ', $sql, 1) ?? $sql;
+    if (strcasecmp($defaultValue, 'NULL') === 0) {
+        return 'DEFAULT NULL';
     }
 
-    if (preg_match('/^CREATE\s+/i', $sql) !== 1) {
-        throw new RuntimeException("Invalid create_sql for view '{$viewName}'.");
-    }
-
-    return $sql;
+    return 'DEFAULT ' . mydump_write_render_default_expression($field, $defaultValue);
 }
 
-function mydump_quote_identifier(string $identifier): string
+/**
+ * Convert one TSV default cell into the exact SQL fragment to place after
+ * `DEFAULT`, preserving explicit quoting when present and otherwise choosing
+ * safe literal quoting rules based on the declared column type.
+ */
+function mydump_write_render_default_expression(array $field, string $defaultValue): string
+{
+    $trimmed = trim($defaultValue);
+    if ($trimmed === '') {
+        return "''";
+    }
+
+    if (preg_match('/^\'(?:[^\']|\'\')*\'$/', $trimmed) === 1) {
+        return $trimmed;
+    }
+
+    $typeToken = trim((string) ($field['type'] ?? ''));
+    $typeCore = str_starts_with(strtolower($typeToken), 'u.') ? substr($typeToken, 2) : $typeToken;
+    $baseType = strtolower(trim((string) preg_replace('/\(.*/', '', $typeCore)));
+
+    if (mydump_write_is_string_like_type($baseType)) {
+        return mydump_write_quote_string($trimmed);
+    }
+
+    if (mydump_write_is_temporal_type($baseType)) {
+        if (mydump_write_is_default_expression($trimmed, '')) {
+            return $trimmed;
+        }
+        return mydump_write_quote_string($trimmed);
+    }
+
+    if (mydump_write_is_unsigned_capable_type($baseType) && is_numeric($trimmed)) {
+        return $trimmed;
+    }
+
+    if (mydump_write_is_default_expression($trimmed, '')) {
+        return $trimmed;
+    }
+
+    return mydump_write_quote_string($trimmed);
+}
+
+/**
+ * Build the optional table-engine clause for `CREATE TABLE`, translating the
+ * compact TSV engine codes back into their MySQL names and omitting the clause
+ * entirely when the TSV leaves the engine blank.
+ */
+function mydump_write_render_engine_clause(string $engineCode): string
+{
+    $normalized = strtoupper(trim($engineCode));
+    if ($normalized === 'IDB') {
+        return 'ENGINE=InnoDB';
+    }
+    if ($normalized === 'MEM') {
+        return 'ENGINE=MEMORY';
+    }
+
+    return '';
+}
+
+/**
+ * Build the optional engine alteration clause for existing tables when the
+ * compact TSV engine code differs from the current table engine and therefore
+ * needs an explicit `ALTER TABLE ... ENGINE=...` operation.
+ */
+function mydump_write_build_engine_alter_clause(string $currentEngineCode, string $desiredEngineCode): ?string
+{
+    $current = strtoupper(trim($currentEngineCode));
+    $desired = strtoupper(trim($desiredEngineCode));
+
+    if ($desired === '' || $desired === $current) {
+        return null;
+    }
+
+    $engineClause = mydump_write_render_engine_clause($desired);
+    return $engineClause !== '' ? $engineClause : null;
+}
+
+/**
+ * Build a stable signature for one field that captures only the parts of the
+ * definition rendered into SQL column clauses, leaving PK, UK, and ordinary
+ * indexes to the separate index diffing logic.
+ */
+function mydump_write_field_signature(array $field): string
+{
+    $properties = (array) ($field['properties'] ?? []);
+
+    return implode('|', [
+        strtolower((string) ($field['name'] ?? '')),
+        strtolower(trim((string) ($field['type'] ?? ''))),
+        trim((string) ($field['length'] ?? '')),
+        ($properties['NN'] ?? false) || ($properties['AI'] ?? false) || ($properties['PK'] ?? false) ? '1' : '0',
+        ($properties['AI'] ?? false) ? '1' : '0',
+        (string) ($field['collation'] ?? ''),
+        (string) ($field['default'] ?? ''),
+        (string) ($field['comment'] ?? ''),
+    ]);
+}
+
+/**
+ * Remove the literal MySQL `unsigned` keyword from a full current column type
+ * while leaving every other modifier intact, allowing current live metadata to
+ * be normalized into the same `u.`-based syntax as the TSV.
+ */
+function mydump_write_strip_unsigned_keyword(string $columnType): string
+{
+    $stripped = preg_replace('/\s+unsigned\b/i', '', $columnType);
+    if ($stripped === null) {
+        return trim($columnType);
+    }
+
+    return trim(preg_replace('/\s+/', ' ', $stripped) ?? $stripped);
+}
+
+/**
+ * Detect default expressions on the write side using the same rule as the read
+ * side so live-database metadata and user-edited TSV values are interpreted in
+ * the same consistent way during diffing and SQL generation.
+ */
+function mydump_write_is_default_expression(string $defaultValue, string $extra): bool
+{
+    if (stripos($extra, 'DEFAULT_GENERATED') !== false) {
+        return true;
+    }
+
+    return preg_match(
+        '/^(CURRENT_TIMESTAMP(?:\(\d+\))?|CURRENT_DATE(?:\(\))?|CURRENT_TIME(?:\(\))?|NOW\(\)|UUID\(\)|\(.+\))$/i',
+        trim($defaultValue)
+    ) === 1;
+}
+
+/**
+ * Identify the string and binary types whose size belongs in the dedicated TSV
+ * `length` column so the write program knows when to reassemble `type(length)`
+ * during SQL generation.
+ */
+function mydump_write_is_length_driven_type(string $dataType): bool
+{
+    return in_array($dataType, ['char', 'varchar', 'binary', 'varbinary'], true);
+}
+
+/**
+ * Identify types that are fully represented by their bare names in TSV and do
+ * not need any parenthesized details preserved when normalizing live database
+ * metadata for comparison against the imported file.
+ */
+function mydump_write_is_simple_type_without_length(string $dataType): bool
+{
+    return in_array(
+        $dataType,
+        [
+            'tinyint', 'smallint', 'mediumint', 'int', 'bigint',
+            'date', 'datetime', 'timestamp', 'time', 'year',
+            'json', 'tinytext', 'text', 'mediumtext', 'longtext',
+            'tinyblob', 'blob', 'mediumblob', 'longblob',
+            'geometry', 'point', 'linestring', 'polygon',
+            'multipoint', 'multilinestring', 'multipolygon', 'geometrycollection',
+        ],
+        true
+    );
+}
+
+/**
+ * Identify types that meaningfully support MySQL's `unsigned` modifier so the
+ * write program can decide whether a TSV `u.` prefix should become the SQL
+ * keyword `unsigned` when rebuilding a column type.
+ */
+function mydump_write_is_unsigned_capable_type(string $dataType): bool
+{
+    return in_array(
+        $dataType,
+        ['tinyint', 'smallint', 'mediumint', 'int', 'bigint', 'decimal', 'numeric', 'float', 'double', 'real'],
+        true
+    );
+}
+
+/**
+ * Identify textual types whose unquoted default values in TSV should be turned
+ * into SQL string literals when generating DDL, which keeps manual editing easy
+ * without sacrificing correct quoting on import.
+ */
+function mydump_write_is_string_like_type(string $dataType): bool
+{
+    return in_array(
+        $dataType,
+        [
+            'char', 'varchar', 'tinytext', 'text', 'mediumtext', 'longtext',
+            'enum', 'set',
+        ],
+        true
+    );
+}
+
+/**
+ * Identify temporal types so the write program can distinguish between literal
+ * date/time defaults that need quoting and recognized SQL expressions like
+ * `CURRENT_TIMESTAMP` that must stay raw.
+ */
+function mydump_write_is_temporal_type(string $dataType): bool
+{
+    return in_array($dataType, ['date', 'datetime', 'timestamp', 'time', 'year'], true);
+}
+
+/**
+ * Emit write-side warnings to standard error after plan construction so the
+ * user sees skipped views and other import-time limitations before statements
+ * are executed, while still keeping the main success output easy to scan.
+ */
+function mydump_write_emit_warnings(array $warnings): void
+{
+    foreach (mydump_write_unique_values($warnings) as $warning) {
+        fwrite(STDERR, $warning . PHP_EOL);
+    }
+}
+
+/**
+ * Return the canonical TSV header order for the write program so header
+ * validation stays local to this half of the file and does not depend on the
+ * read program's implementation details.
+ */
+function mydump_write_tsv_headers(): array
+{
+    return ['tv', 'table', 'eng', 'name', 'type', 'length', 'properties', 'index', 'collation', 'default', 'comment'];
+}
+
+/**
+ * Deduplicate write-side values locally so warnings and plan metadata remain
+ * stable without creating extra cross-program dependencies beyond parsing.
+ */
+function mydump_write_unique_values(array $values): array
+{
+    $seen = [];
+    $result = [];
+
+    foreach ($values as $value) {
+        $text = trim((string) $value);
+        if ($text === '') {
+            continue;
+        }
+
+        $key = strtolower($text);
+        if (isset($seen[$key])) {
+            continue;
+        }
+
+        $seen[$key] = true;
+        $result[] = $text;
+    }
+
+    return $result;
+}
+
+/**
+ * Quote one MySQL identifier for write-side DDL generation, ensuring that the
+ * generated SQL remains correct for reserved words and special characters in
+ * table, column, and index names.
+ */
+function mydump_write_quote_identifier(string $identifier): string
 {
     return '`' . str_replace('`', '``', $identifier) . '`';
 }
 
-function mydump_quote_string(string $value): string
+/**
+ * Quote one SQL string literal using simple single-quote escaping so comments
+ * and default values generated by the write program are emitted as valid SQL
+ * without depending on a live PDO quote call.
+ */
+function mydump_write_quote_string(string $value): string
 {
     return "'" . str_replace("'", "''", $value) . "'";
-}
-
-function mydump_parse_yes_no(string $value, bool $default): bool
-{
-    $v = strtolower(trim($value));
-    if ($v === '') {
-        return $default;
-    }
-
-    if (in_array($v, ['yes', 'y', '1', 'true', 'on', 'null'], true)) {
-        return true;
-    }
-    if (in_array($v, ['no', 'n', '0', 'false', 'off'], true)) {
-        return false;
-    }
-
-    return $default;
-}
-
-function mydump_row_is_empty(array $assoc): bool
-{
-    foreach ($assoc as $value) {
-        if (trim((string) $value) !== '') {
-            return false;
-        }
-    }
-    return true;
-}
-
-function mydump_normalize_header(string $value): string
-{
-    $key = strtolower(trim($value));
-    $key = str_replace([' ', '-', '.'], '_', $key);
-    return preg_replace('/[^a-z0-9_]/', '', $key) ?? '';
-}
-
-function mydump_is_assoc(array $array): bool
-{
-    $keys = array_keys($array);
-    return $keys !== array_keys($keys);
 }
